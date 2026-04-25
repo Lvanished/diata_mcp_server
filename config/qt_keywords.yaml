@@ -1,0 +1,28 @@
+# Terms used for context window extraction (case-insensitive matching).
+qt_terms:
+  - QT
+  - QT prolongation
+  - long QT
+  - torsades de pointes
+  - TdP
+  - hERG
+  - KCNH2
+  - IKr
+  - repolarization
+  - action potential duration
+  - APD
+  - APD90
+  - field potential duration
+  - FPD
+  - FPDc
+
+# Subset used when building the PubMed query OR-clause in query_builder.
+search_terms:
+  - QT prolongation
+  - long QT
+  - torsades de pointes
+  - hERG
+  - IKr
+  - repolarization
+  - APD
+  - FPD

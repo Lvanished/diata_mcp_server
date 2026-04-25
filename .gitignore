@@ -1,0 +1,26 @@
+# 运行产物与本地数据（不提交）
+outputs/
+output/
+input/
+
+# 环境与密钥
+.env
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 编辑器 / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
