@@ -10,6 +10,25 @@ from typing import Any
 import pandas as pd
 
 
+def resolve_excel_input_path(project_root: Path, xlsx: Path) -> Path:
+    """
+    Resolve ``--input-xlsx``:
+
+    - Absolute paths are returned resolved.
+    - Else try ``project_root / xlsx`` (repo-relative).
+    - Else try ``project_root / input / xlsx`` (i.e. under the repo ``input/`` folder).
+    """
+    if xlsx.is_absolute():
+        return xlsx.resolve()
+    direct = (project_root / xlsx).resolve()
+    if direct.is_file():
+        return direct
+    under = (project_root / "input" / xlsx).resolve()
+    if under.is_file():
+        return under
+    return direct
+
+
 def resolve_sheet(
     xlsx_path: str | Path,
     sheet: str | int | None,

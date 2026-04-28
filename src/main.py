@@ -6,7 +6,7 @@ CLI: PubMed search → metadata → PMC full text → keyword context → JSON +
 
 Single drug: ``--drug``
 
-Batch from DIQTA spreadsheet: ``--input-xlsx`` (uses ``name`` column by default).
+Batch: ``--input-xlsx`` (repo path or file under ``input/``). Default ``--max-drugs`` 10 (use ``0`` for all).
 
 """
 
@@ -48,13 +48,13 @@ from .article_filter import (
 
 from .context_extractor import extract_keyword_contexts
 
-from .excel_input import build_drug_jobs, resolve_sheet
+from .excel_input import build_drug_jobs, resolve_excel_input_path, resolve_sheet
 
 from .fulltext_extractor import fetch_fulltext_for_articles
 
 from .mcp_client import PubMedMCPClient
 
-from .query_builder import build_pubmed_query, iter_pubmed_query_fallbacks
+from .query_builder import iter_layered_pubmed_query_rounds, iter_pubmed_query_fallbacks
 
 from .report_writer import write_excel_batch_markdown, write_json, write_markdown_report
 
@@ -98,6 +98,10 @@ async def run_pipeline_for_drug(
 
     terms: list[str],
 
+    *,
+
+    search_strategy: str = "default",
+
 ) -> dict:
 
     """One full pipeline using an existing MCP session (stdio or HTTP)."""
@@ -108,46 +112,114 @@ async def run_pipeline_for_drug(
     search: dict = {}
     q_used = ""
     strategy_used = ""
+    layered_round_used: str | None = None
 
-    for label, q in iter_pubmed_query_fallbacks(drug):
-        log.info("PubMed try [%s]: %s", label, q)
-        search = await client.search_articles(q, top_n)
-        if not isinstance(search, dict):
-            search = {}
-        tf = int(search.get("totalFound") or 0)
-        pmids_try = [str(p) for p in (search.get("pmids") or []) if p]
-        attempts_meta.append(
-            {
-                "strategy": label,
-                "query": q,
-                "total_found": tf,
-                "returned": len(pmids_try),
-            }
+    if search_strategy == "layered":
+        note_extra_layered = (
+            "Layered search: strict → optional broad → optional salt-stripped strict; "
+            "two branches per tier (hERG/channel + QT/TdP TA) merged; "
+            "stops early once min hits reached. PMC open full text is fetched when PMCID is present (same as default)."
         )
-        q_used, strategy_used = q, label
-        if tf > 0 and pmids_try:
-            if label != "ta_quoted":
-                log.info("PubMed: hits after broader strategy %s (total=%s)", label, tf)
-            break
+        query_rounds = iter_layered_pubmed_query_rounds(drug)
+        pmids_merged: list[str] = []
+        seen_pmids: set[str] = set()
+        effective_parts: list[str] = []
+
+        for qr in query_rounds:
+            layered_round_used = qr.name
+            seen_round: set[str] = set()
+            order_round: list[str] = []
+            for label, q in qr.queries:
+                log.info("PubMed layered [%s/%s]: %s", qr.name, label, q)
+                s = await client.search_articles(q, top_n)
+                if not isinstance(s, dict):
+                    s = {}
+                tf = int(s.get("totalFound") or 0)
+                pmids_try = [str(p) for p in (s.get("pmids") or []) if p]
+                attempts_meta.append(
+                    {
+                        "strategy": label,
+                        "query": q,
+                        "total_found": tf,
+                        "returned": len(pmids_try),
+                        "round": qr.name,
+                    }
+                )
+                eff = str(s.get("effectiveQuery") or q)
+                if eff and eff not in effective_parts:
+                    effective_parts.append(eff)
+                for p in pmids_try:
+                    if p not in seen_round:
+                        seen_round.add(p)
+                        order_round.append(p)
+            for p in order_round:
+                if p not in seen_pmids:
+                    seen_pmids.add(p)
+                    pmids_merged.append(p)
+            strategy_used = f"layered:{qr.name}"
+            if qr.min_hits_to_stop > 0 and len(pmids_merged) >= qr.min_hits_to_stop:
+                break
+
+        unique_union = len(pmids_merged)
+        q_used = " | ".join(a["query"] for a in attempts_meta if a.get("query"))
+        pmids = pmids_merged[:top_n]
+        total_found = unique_union
+        search = {
+            "totalFound": total_found,
+            "pmids": pmids,
+            "notice": None,
+            "effectiveQuery": " ; ".join(effective_parts) if effective_parts else q_used,
+        }
+        log.info(
+            "Layered search: last_round=%s, union pmids=%s (after cap top_n=%s: %s)",
+            layered_round_used,
+            unique_union,
+            top_n,
+            len(pmids),
+        )
+    else:
+        for label, q in iter_pubmed_query_fallbacks(drug):
+            log.info("PubMed try [%s]: %s", label, q)
+            search = await client.search_articles(q, top_n)
+            if not isinstance(search, dict):
+                search = {}
+            tf = int(search.get("totalFound") or 0)
+            pmids_try = [str(p) for p in (search.get("pmids") or []) if p]
+            attempts_meta.append(
+                {
+                    "strategy": label,
+                    "query": q,
+                    "total_found": tf,
+                    "returned": len(pmids_try),
+                }
+            )
+            q_used, strategy_used = q, label
+            if tf > 0 and pmids_try:
+                if label != "ta_quoted":
+                    log.info("PubMed: hits after broader strategy %s (total=%s)", label, tf)
+                break
 
     note: str | None = None
     if search.get("notice"):
         note = str(search.get("notice"))
         log.warning("Search notice: %s", note)
         console.print(f"[yellow]Search notice: {note}[/yellow]")
-    if len(attempts_meta) > 1 and int(search.get("totalFound") or 0) > 0:
+    if search_strategy != "layered" and len(attempts_meta) > 1 and int(search.get("totalFound") or 0) > 0:
         extra = (
             f" Recovered with broader query strategy: {strategy_used!r} "
             f"({len(attempts_meta) - 1} prior strateg(ies) returned 0 hits)."
         )
         note = f"{note}{extra}" if note else extra.strip()
         log.info(note)
+    if search_strategy == "layered":
+        note = f"{note_extra_layered}\n{note}" if note else note_extra_layered
 
     effective = str(search.get("effectiveQuery") or q_used)
     q = q_used
 
-    pmids = [str(p) for p in (search.get("pmids") or []) if p]
-    total_found = int(search.get("totalFound") or 0)
+    if search_strategy != "layered":
+        pmids = [str(p) for p in (search.get("pmids") or []) if p]
+        total_found = int(search.get("totalFound") or 0)
     log.info("Found total=%s, retrieved pmids=%s (strategy=%s)", total_found, len(pmids), strategy_used)
 
 
@@ -248,6 +320,8 @@ async def run_pipeline_for_drug(
 
         "drug_name": drug,
 
+        "search_strategy": search_strategy,
+
         "query": q,
 
         "query_strategy": strategy_used,
@@ -257,6 +331,8 @@ async def run_pipeline_for_drug(
         "effective_query": effective,
 
         "search_total_found": total_found,
+
+        "layered_round": layered_round_used,
 
         "summary": {
 
@@ -280,7 +356,7 @@ async def run_pipeline_for_drug(
 
 
 
-async def _run_one_drug(drug: str, top_n: int, window: int) -> dict:
+async def _run_one_drug(drug: str, top_n: int, window: int, *, search_strategy: str) -> dict:
 
     root = _project_root()
 
@@ -292,7 +368,9 @@ async def _run_one_drug(drug: str, top_n: int, window: int) -> dict:
 
     async with PubMedMCPClient.from_env(root) as client:
 
-        return await run_pipeline_for_drug(client, drug, top_n, window, terms)
+        return await run_pipeline_for_drug(
+            client, drug, top_n, window, terms, search_strategy=search_strategy
+        )
 
 
 
@@ -315,6 +393,8 @@ async def _run_excel_batch(
     max_drugs: int | None,
 
     dedupe_by_name: bool,
+
+    search_strategy: str,
 
 ) -> dict:
 
@@ -364,7 +444,9 @@ async def _run_excel_batch(
 
             try:
 
-                r = await run_pipeline_for_drug(client, name, top_n, window, terms)
+                r = await run_pipeline_for_drug(
+                    client, name, top_n, window, terms, search_strategy=search_strategy
+                )
 
                 results.append({**j, "ok": True, "error": None, "result": r})
 
@@ -385,6 +467,8 @@ async def _run_excel_batch(
         "sheet": sheet_name,
 
         "name_column": name_column,
+
+        "search_strategy": search_strategy,
 
         "row_count": n_rows,
 
@@ -452,7 +536,10 @@ def _parse_args() -> argparse.Namespace:
 
         default=None,
 
-        help="Path to an Excel file with a name column (e.g. DIQTA 处理后数据.xlsx)",
+        help=(
+            "Excel path (repo-relative, absolute, or filename under input/). "
+            "Needs a name column (default: name)."
+        ),
 
     )
 
@@ -504,11 +591,13 @@ def _parse_args() -> argparse.Namespace:
 
         type=int,
 
-        default=None,
+        default=10,
 
         dest="max_drugs",
 
-        help="Process at most this many names (after dedupe, order preserved) — for testing",
+        help=(
+            "Batch: max unique names after dedupe (order preserved). Default 10. Use 0 for no limit."
+        ),
 
     )
 
@@ -519,6 +608,26 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
 
         help="Run every data row (same name may be queried more than once)",
+
+    )
+
+    p.add_argument(
+
+        "--search-strategy",
+
+        type=str,
+
+        choices=["default", "layered"],
+
+        default="default",
+
+        dest="search_strategy",
+
+        help=(
+            "PubMed query mode: default (single QT_OR + fallbacks) "
+            "or layered (strict→broad→salt tiers, two branches each, early stop). "
+            "Both fetch PMC open full text when PMCID is available."
+        ),
 
     )
 
@@ -533,6 +642,13 @@ def re_safe_filename(name: str) -> str:
     s = "".join(c if c.isalnum() or c in "._-" else "_" for c in name.strip().lower())
 
     return s or "result"
+
+
+def _effective_max_drugs(n: int) -> int | None:
+    """``0`` or negative means no cap (process all qualifying rows)."""
+    if n <= 0:
+        return None
+    return n
 
 
 
@@ -590,7 +706,11 @@ def main() -> int:
 
         try:
 
-            data = asyncio.run(_run_one_drug(drug, int(args.top_n), int(args.window)))
+            data = asyncio.run(
+                _run_one_drug(
+                    drug, int(args.top_n), int(args.window), search_strategy=args.search_strategy
+                )
+            )
 
         except Exception as e:  # noqa: BLE001
 
@@ -646,7 +766,7 @@ def main() -> int:
 
         return 2
 
-    xlsx_path = xlsx if xlsx.is_absolute() else (root / xlsx)
+    xlsx_path = resolve_excel_input_path(root, xlsx)
 
     sheet = _sheet_arg(args.sheet)
 
@@ -656,7 +776,13 @@ def main() -> int:
 
         return 2
 
-    rel_for_meta = str(xlsx).replace("\\", "/")
+    try:
+
+        rel_for_meta = str(xlsx_path.relative_to(root)).replace("\\", "/")
+
+    except ValueError:
+
+        rel_for_meta = str(xlsx_path).replace("\\", "/")
 
 
 
@@ -676,9 +802,11 @@ def main() -> int:
 
                 name_column=args.name_column,
 
-                max_drugs=args.max_drugs,
+                max_drugs=_effective_max_drugs(int(args.max_drugs)),
 
                 dedupe_by_name=not args.no_dedupe,
+
+                search_strategy=args.search_strategy,
 
             )
 

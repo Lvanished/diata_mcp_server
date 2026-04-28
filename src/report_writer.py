@@ -44,9 +44,35 @@ def write_markdown_report(data: dict[str, Any], output_path: str | Path) -> None
     lines.append("")
 
     lines.append("## Query")
-    lines.append("```")
-    lines.append(str(data.get("query", "")))
-    lines.append("```")
+    ss = str(data.get("search_strategy", "default"))
+    lines.append(f"- Search strategy: `{ss}`")
+    attempts = data.get("query_attempts") or []
+    if ss == "layered" and attempts:
+        lr = data.get("layered_round")
+        if lr is not None:
+            lines.append(f"- Layered round used: {lr}")
+        lines.append("")
+        lines.append("### Layered branches")
+        for a in attempts:
+            strat = a.get("strategy", "")
+            rnd = a.get("round", "")
+            tf = a.get("total_found", "")
+            ret = a.get("returned", "")
+            lines.append(f"- **{strat}** (round {rnd}): total_found={tf}, returned={ret}")
+            qn = str(a.get("query", ""))
+            if qn:
+                lines.append("  ```")
+                lines.extend("  " + ln for ln in qn.splitlines() or [qn])
+                lines.append("  ```")
+        lines.append("")
+        lines.append("Merged query string (join of branches):")
+        lines.append("```")
+        lines.append(str(data.get("query", "")))
+        lines.append("```")
+    else:
+        lines.append("```")
+        lines.append(str(data.get("query", "")))
+        lines.append("```")
     if data.get("note"):
         lines.append("")
         lines.append(f"> {data['note']}")
@@ -105,6 +131,7 @@ def write_excel_batch_markdown(payload: dict[str, Any], output_path: str | Path)
         "",
         f"**Source:** `{payload.get('source_file', '')}`",
         f"**Sheet:** `{payload.get('sheet', '')}` · **name column:** `{payload.get('name_column', '')}`",
+        f"**Search strategy:** `{payload.get('search_strategy', 'default')}`",
         f"**Drugs in file / run:** {payload.get('row_count', 0)} / {payload.get('drugs_run', 0)}",
         "",
         "| # | row | drug | PubChem | PubMed n | PMCID n | fulltext n | context art. | error |",
