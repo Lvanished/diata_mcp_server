@@ -1,6 +1,6 @@
 # pubmed_pmc_drug_context_agent
 
-面向 **DIQT / 心脏毒性** 场景的文献流水线：输入**药名**（或 Excel 批量药名）→ 通过 **[cyanheads/pubmed-mcp-server](https://github.com/cyanheads/pubmed-mcp-server)** 访问 PubMed/PMC → 保留带 **PMCID** 的文献并拉取 **PMC 开放全文**（若可得）→ 在摘要与全文中做 **QT/复极化相关关键词** 窗口提取，并打上 **`evidence_type`** → 输出 **JSON + Markdown**（批量时另有汇总表）。
+面向 **DIQT / 心脏毒性** 场景的文献流水线：输入**药名**（或 Excel 批量药名）→ 通过 **[cyanheads/pubmed-mcp-server](https://github.com/cyanheads/pubmed-mcp-server)** 访问 PubMed/PMC → 可选 **`--search-strategy layered`** 分层 PubMed 检索（动机与两条分支的设计见 **§5**）→ 保留带 **PMCID** 的文献并拉取 **PMC 开放全文**（若可得）→ 在摘要与全文中做 **QT/复极化相关关键词** 窗口提取，并打上 **`evidence_type`** → 输出 **JSON + Markdown**（批量时另有汇总表）。
 
 ---
 
@@ -113,16 +113,65 @@ pubmed_pmc_drug_context_agent/
     → report_writer → JSON / Markdown
 ```
 
+`--search-strategy layered` 时仅在第一步替换为 `iter_layered_pubmed_query_rounds`（多轮、双分支合并 PMID），其余步骤相同。
+
 ---
 
-## 5. 重要概念：PubMed ≠ PMC 全文
+## 5. 分层检索策略说明（`--search-strategy layered`）
+
+本策略与 **`default`** 共用同一套 downstream（拉元数据、PMC 全文、`qt_keywords.yaml` 窗口与 `evidence_type`），**区别在 PubMed 检索如何组式、如何扩召回**。
+
+### 5.1 设计动机
+
+- **`default`**：一条较宽的「药名 + QT/复极化 OR 块」，无命中时再**纵向**换盐型、`[Text Word]`、缩短 OR 等 fallback。
+- **`layered`（新策略）**：把文献需求拆成两条**可解释**的 PubMed 轴，再按**严格 → 放宽 → 去盐后再严格**逐级尝试；每层内在 PMID 层面**并集**，命中足够则**提前结束**后续层，减少无谓的宽泛检索。
+
+适用于希望 **hERG/通道机制** 与 **QT/TdP 临床/表型** 在检索上分离、且 QT 侧希望**主要锚定在标题/摘要** 的场景。
+
+### 5.2 每一层内的两条分支（实现于 `src/query_builder.py`）
+
+| 分支 | 逻辑概要 | 说明 |
+|------|------------|------|
+| **A（hERG / IKr 轴）** | `药名[Title/Abstract]` **且** `(hERG \| KCNH2 \| ether-a-go-go \| IKr)` **且**「阻断/抑制/通道/current」类词 | 通道相关词在检索式中**不限定 [Title/Abstract]**，以便 Title、Abstract、MeSH 等字段与 PubMed 惯例一致。strict / broad 两档差别主要在阻断侧词表宽窄（见 `build_herg_query(..., broad=...)`）。 |
+| **B（QT / TdP 轴）** | `药名[Title/Abstract]` **且** 一串 **仅作用于 Title/Abstract** 的 QT 延长、长 QT、TdP、proarrhythmia 等短语 | 不要求一篇文献**同时**满足 A 与 B：本层 PMID 集合为 **A 的命中的 PMID ∪ B 的 PMID**（客户端去重合并，通常先保留 A 的顺序再追加 B 的新 PMID）。 |
+
+每一**层（tier）**都会跑完当前层配置下的 **A + B**，再根据合并后的唯一 PMID 数决定是否进入下一层。
+
+### 5.3 分层轮次（`QueryRound`）
+
+源码中 `iter_layered_pubmed_query_rounds` 默认顺序为：
+
+1. **`strict`**：两分支均用**较窄**关键词（`build_*Query(..., broad=False)`）。
+2. **`broad`**：同一药名，两分支改为 **broad=True**（更多 TdP、channel/current、宽 block 等同义词）。
+3. **`salt_stripped_strict`**：仅当 `strip_salt_suffix(药名)` 与原名**字面不同**时再跑一轮，且两分支均为 **strict**（去盐后往往更接近题录常用名）。
+
+每层带有 `min_hits_to_stop`（默认 **1**）：若本层合并后的唯一 PMID 数 **≥ 该阈值**，则**不再执行**更靠后的轮次。轮次名称会写入结果中的 `layered_round`、`query_attempts[].round` 等字段。
+
+### 5.4 与 `default` 的对比小结
+
+| 维度 | `default` | `layered` |
+|------|-----------|-----------|
+| 主检索形状 | 单式 + 多条 fallback 链 | 每层 **2 条**检索式并集 + **多轮** tier |
+| QT 相关短语 | 与同 OR 块中药名组合，字段策略与 `query_builder._or_block` 一致 | 独立分支 B，**显式限定在 Title/Abstract** |
+| hERG/通道 | 含在大 OR 中 | 独立分支 A，并可与「阻断/通道」词 AND |
+| 无结果时 | 换盐型、Text Word、缩短 OR | 换 tier（broad、去盐 strict） |
+
+### 5.5 启用方式与输出
+
+命令行加 **`--search-strategy layered`**（单药与 Excel 批量均支持）。JSON 中会包含 `search_strategy`、`query_attempts`（每条含策略标签、检索式、`round`）、`layered_round` 等；Markdown 单药报告对分层会列出各分支检索式。
+
+与检索意图和全文关键词摘录是否一致，可用 **`scripts/compare_layered_vs_fulltext.py`** 对导出 JSON 生成审计 CSV（详见 **§11.3**）。
+
+---
+
+## 6. 重要概念：PubMed ≠ PMC 全文
 
 - **PubMed**：通常可得题录、摘要等；由检索与 `pubmed_fetch_articles` 覆盖。
 - **PMC 开放全文**：仅一部分文献具备；依赖 PMCID 与开放获取及服务端解析能力。流水线在全文不可得时仍保留**摘要级**命中，并在结果中体现 `fulltext_available` / 错误说明。
 
 ---
 
-## 6. Python 环境与依赖
+## 7. Python 环境与依赖
 
 - 建议 **Python 3.10+**。
 
@@ -138,7 +187,7 @@ cp .env.example .env
 
 ---
 
-## 7. 部署上游 MCP 的三种方式（可选）
+## 8. 部署上游 MCP 的三种方式（可选）
 
 上游使用 [Bun](https://bun.sh/) 构建（`bun run rebuild`、`bun run start:stdio` / `start:http`），**不要**依赖未文档化的 `npm start` 作为主入口。
 
@@ -150,7 +199,7 @@ cp .env.example .env
 
 ---
 
-## 8. 传输方式：STDIO 与 HTTP
+## 9. 传输方式：STDIO 与 HTTP
 
 | 模式 | 典型场景 | 启动上游（示例） |
 |------|----------|------------------|
@@ -161,7 +210,7 @@ cp .env.example .env
 
 ---
 
-## 9. `.env` 配置摘要
+## 10. `.env` 配置摘要
 
 复制 `.env.example` 为 `.env`，至少关注：
 
@@ -173,7 +222,7 @@ cp .env.example .env
 
 ---
 
-## 10. 运行命令
+## 11. 运行命令
 
 在项目根目录：
 
@@ -182,7 +231,7 @@ cp .env.example .env
 python -m src.main --drug "thioridazine" --top-n 20
 ```
 
-### 10.1 PubMed 检索策略：`--search-strategy`
+### 11.1 PubMed 检索策略：`--search-strategy`
 
 | 取值 | 说明 |
 |------|------|
@@ -198,7 +247,7 @@ python -m src.main --input-xlsx "input/DIQTA处理后数据.xlsx" --search-strat
 
 结果 JSON 中会多出 `search_strategy`、`layered_round`、`query_attempts`（含各分支检索式与 `round` 名称）等字段，Markdown 报告对 `layered` 会列出各分支。
 
-### 10.2 从 Excel / `input/` 批量
+### 11.2 从 Excel / `input/` 批量
 
 **从 DIQTA Excel 批量**（默认读 `name` 列、首张表、药名去重）：
 
@@ -226,7 +275,7 @@ python -m src.main --input-xlsx "input/DIQTA处理后数据.xlsx" --top-n 20
 bash scripts/run_example.sh
 ```
 
-### 10.3 分层检索 vs 关键词摘录：对比报告（可选）
+### 11.3 分层检索 vs 关键词摘录：对比报告（可选）
 
 流水线导出的 JSON **不含原始全文 `sections`**（写入前已去掉）。脚本 `scripts/compare_layered_vs_fulltext.py` 用 **标题 + 摘要 + 各条 `contexts[].context`** 近似「管线实际用上的文本」，与 **分层检索在 PubMed 侧的两条分支意图**（hERG+阻断轴、QT-in-TA 轴 + 药名是否在 TA）做对照，生成 **CSV** 便于抽查。
 
@@ -249,7 +298,7 @@ python scripts/compare_layered_vs_fulltext.py outputs/某_batch_results.json -o 
 
 ---
 
-## 11. `evidence_type`（每条 context）
+## 12. `evidence_type`（每条 context）
 
 用于粗分类 DIQT/心脏毒性相关表述：
 
@@ -260,7 +309,7 @@ python scripts/compare_layered_vs_fulltext.py outputs/某_batch_results.json -o 
 
 ---
 
-## 12. JSON 结果结构（概要）
+## 13. JSON 结果结构（概要）
 
 **单药**（`--drug`）：根对象含 `drug_name`、`search_strategy`（`default` | `layered`）、`query`、`query_strategy`、`query_attempts`（`layered` 时含各分支与 `round` 名）、`layered_round`（仅 **`layered`** 时为最后一轮 tier 名称，如 `strict`；`default` 时多为 `null`）、`effective_query`、`search_total_found`、`summary`、可选 `note`，以及 `articles[]`。每篇文章至少包括：`pmid`、`pmcid`（无则空串）、`title`、`abstract`、`journal`、`year`、`fulltext_available`、`matched_terms`、`contexts`（含 `source`、`section`、`matched_term`、`context`、`evidence_type`）。
 
@@ -268,7 +317,7 @@ python scripts/compare_layered_vs_fulltext.py outputs/某_batch_results.json -o 
 
 ---
 
-## 13. 常见问题
+## 14. 常见问题
 
 - **Windows STDIO 报找不到文件（WinError 2）**：多为未安装 **Bun** 或未在 PATH 中，或 `MCP_SERVER_CWD` 路径错误。可改用 **`MCP_TRANSPORT=http`** 与 `MCP_SERVER_URL`，或改用 `MCP_SERVER_COMMAND=npx` + `MCP_SERVER_ARGS=-y,@cyanheads/pubmed-mcp-server@latest`（需 Node）。
 - **HTTP 4xx/5xx**：确认 URL 含 **`/mcp`**、防火墙与 TLS；可用公网测试 URL 对比是否为本地服务问题。
@@ -278,6 +327,6 @@ python scripts/compare_layered_vs_fulltext.py outputs/某_batch_results.json -o 
 
 ---
 
-## 14. 许可
+## 15. 许可
 
 本目录中的 Python 客户端与工具代码为薄封装与业务流水线；上游 **pubmed-mcp-server** 为 **Apache-2.0**。使用与再发布文献内容时请遵守 NCBI 与出版商条款。
