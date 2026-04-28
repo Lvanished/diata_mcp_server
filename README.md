@@ -26,7 +26,7 @@
 | **作用** | 按 PubMed 检索式搜索文献，返回 PMID 列表及命中数量等。 |
 | **本地封装** | `PubMedMCPClient.search_articles(query, max_results)` |
 | **调用参数（本仓库传入）** | `query`（检索字符串）、`maxResults`（对应 CLI `--top-n`）、`summaryCount`: `0`、`offset`: `0` |
-| **在流水线中的位置** | `src/main.py`：`run_pipeline_for_drug` 中结合 `query_builder.iter_pubmed_query_fallbacks` 多次尝试不同检索式，直到有结果或策略用尽。 |
+| **在流水线中的位置** | `src/main.py`：`run_pipeline_for_drug` 中按 `--search-strategy` 选择检索：`default` 时用 `query_builder.iter_pubmed_query_fallbacks`；`layered` 时用 `iter_layered_pubmed_query_rounds`（多轮、多分支合并，见下文）。 |
 
 ### 2.2 `pubmed_fetch_articles`
 
@@ -63,8 +63,10 @@ pubmed_pmc_drug_context_agent/
 ├── config/
 │   └── qt_keywords.yaml      # QT/复极化等关键词表（供 context_extractor 使用）
 ├── scripts/
-│   ├── setup_pubmed_mcp.sh   # 一次性：克隆并构建上游 pubmed-mcp-server（需 Bun）
-│   └── run_example.sh        # 示例：单药 thioridazine，--top-n 20
+│   ├── setup_pubmed_mcp.sh              # 一次性：克隆并构建上游 pubmed-mcp-server（需 Bun）
+│   ├── run_example.sh                   # 示例：单药 thioridazine，--top-n 20
+│   └── compare_layered_vs_fulltext.py   # 可选：对比分层检索意图 vs 导出结果中的关键词摘录，生成 CSV
+├── input/                    # 建议放批量 Excel；相对路径若不在仓库根下存在，会再试 input/<文件名>
 ├── src/
 │   ├── main.py               # CLI 入口；单药 / Excel 批量；串联整条流水线
 │   ├── mcp_client.py         # MCP 客户端：STDIO 或 HTTP；封装三个 PubMed 工具
@@ -83,7 +85,7 @@ pubmed_pmc_drug_context_agent/
 
 - **`main.py`**：解析参数、加载 `qt_keywords.yaml`、建立 MCP 会话、对单个或批量药名执行 `run_pipeline_for_drug`、写输出文件。
 - **`mcp_client.py`**：根据 `MCP_TRANSPORT` 选择 `streamable_http_client` 或 `stdio_client`；解析工具返回 JSON；仅暴露 `search_articles` / `fetch_articles` / `fetch_fulltext_pmc`。
-- **`query_builder.py`**：生成严格与放宽的 PubMed 检索式，供多次搜索尝试。
+- **`query_builder.py`**：生成 PubMed 检索式。`default`：药名 + QT/复极化 OR 块与多种 fallback；`layered`：分层轮次（strict / broad / 去盐 strict），每轮两条分支（hERG+通道阻断词、QT/TdP 且限定 Title/Abstract），详见源码中 `QueryRound` 与 `build_herg_query` / `build_qt_query`。
 - **`article_filter.py`**：统一文章字段；筛选带 PMCID 的记录供全文步骤使用。
 - **`fulltext_extractor.py`**：调用 MCP 全文工具并与元数据合并；**不**做 QT 关键词匹配。
 - **`context_extractor.py`**：在摘要与全文段落中匹配 `qt_keywords.yaml`；产出 `matched_terms`、`contexts` 及 `evidence_type`。
@@ -180,17 +182,37 @@ cp .env.example .env
 python -m src.main --drug "thioridazine" --top-n 20
 ```
 
+### 10.1 PubMed 检索策略：`--search-strategy`
+
+| 取值 | 说明 |
+|------|------|
+| **`default`**（默认） | 药名 `[Title/Abstract]` + 较宽的 QT/复极化 OR 块；无结果时自动换盐型、`[Text Word]`、缩短 QT 子等 fallback（`iter_pubmed_query_fallbacks`）。 |
+| **`layered`** | **分层检索**：按顺序执行 `strict` → `broad`（可选）→ `salt_stripped_strict`（药名去盐后若与原名不同）。每一层内对两条检索式 **合并 PMID**（hERG/通道相关 + QT 短语且 **QT 侧限定 Title/Abstract**）；当本层合并后的唯一 PMID 数 ≥ `min_hits_to_stop`（默认 1）时，不再跑后续层。有 PMCID 时仍会拉 **PMC 开放全文**（与 `default` 一致）。 |
+
+启用分层示例：
+
+```bash
+python -m src.main --drug "dofetilide" --search-strategy layered --top-n 20
+python -m src.main --input-xlsx "input/DIQTA处理后数据.xlsx" --search-strategy layered
+```
+
+结果 JSON 中会多出 `search_strategy`、`layered_round`、`query_attempts`（含各分支检索式与 `round` 名称）等字段，Markdown 报告对 `layered` 会列出各分支。
+
+### 10.2 从 Excel / `input/` 批量
+
 **从 DIQTA Excel 批量**（默认读 `name` 列、首张表、药名去重）：
 
 ```bash
 python -m src.main --input-xlsx "input/DIQTA处理后数据.xlsx" --top-n 20
 ```
 
+- 若给出的相对路径在**仓库根下**不存在，会再尝试 **`input/<同一相对路径>`**（便于只写文件名：`--input-xlsx DIQTA处理后数据.xlsx`）。
+- **`--max-drugs`**：**默认 `10`**（去重后最多处理多少个药名）。**`--max-drugs 0`** 表示不限制、跑完全表。
+
 常用参数：
 
 - `--name-column name`：药名所在列（默认 `name`）。
 - `--sheet 0` 或 `--sheet SheetName`：工作表。
-- `--max-drugs 50`：去重后最多处理多少个药名（测试/限流）。
 - `--no-dedupe`：按行处理，同名可出现多次。
 - `--out-dir`：输出目录（默认 `outputs/`）。
 
@@ -203,6 +225,27 @@ python -m src.main --input-xlsx "input/DIQTA处理后数据.xlsx" --top-n 20
 ```bash
 bash scripts/run_example.sh
 ```
+
+### 10.3 分层检索 vs 关键词摘录：对比报告（可选）
+
+流水线导出的 JSON **不含原始全文 `sections`**（写入前已去掉）。脚本 `scripts/compare_layered_vs_fulltext.py` 用 **标题 + 摘要 + 各条 `contexts[].context`** 近似「管线实际用上的文本」，与 **分层检索在 PubMed 侧的两条分支意图**（hERG+阻断轴、QT-in-TA 轴 + 药名是否在 TA）做对照，生成 **CSV** 便于抽查。
+
+```bash
+# 默认在同级目录写出 <json 主名>_layered_audit.csv
+python scripts/compare_layered_vs_fulltext.py outputs/某_batch_results.json
+
+# 指定输出路径
+python scripts/compare_layered_vs_fulltext.py outputs/某_batch_results.json -o outputs/my_audit.csv
+```
+
+**`correspondence` 列含义概要：**
+
+- **`ok_intent_and_context`**：宽泛意图与「至少有一条 keyword context」一致。
+- **`gap_no_keyword_context`**：意图上像能命中，但导出结果里没有 `contexts`（词表/窗口与检索式不一致、或证据只在未进入 context 的正文段落等）。
+- **`gap_context_not_matching_layered_or`**：管线有关键词命中，但脚本用规则**重构不出**分层 OR（例如 Excel 药名为盐型全名、题录只用 base name，导致 `drug_in_title_abstract` 为假）。
+- **`weak_no_intent_no_context`**：两侧都弱，建议人工看该 PMID。
+
+若未使用 `layered` 跑出的 JSON，脚本会 **stderr 警告**，仍会计算一遍供参考。
 
 ---
 
@@ -219,9 +262,9 @@ bash scripts/run_example.sh
 
 ## 12. JSON 结果结构（概要）
 
-**单药**（`--drug`）：根对象含 `drug_name`、`query`、`effective_query`、`search_total_found`、`summary`、可选 `note`，以及 `articles[]`。每篇文章至少包括：`pmid`、`pmcid`（无则空串）、`title`、`abstract`、`journal`、`year`、`fulltext_available`、`matched_terms`、`contexts`（含 `source`、`section`、`matched_term`、`context`、`evidence_type`）。
+**单药**（`--drug`）：根对象含 `drug_name`、`search_strategy`（`default` | `layered`）、`query`、`query_strategy`、`query_attempts`（`layered` 时含各分支与 `round` 名）、`layered_round`（仅 **`layered`** 时为最后一轮 tier 名称，如 `strict`；`default` 时多为 `null`）、`effective_query`、`search_total_found`、`summary`、可选 `note`，以及 `articles[]`。每篇文章至少包括：`pmid`、`pmcid`（无则空串）、`title`、`abstract`、`journal`、`year`、`fulltext_available`、`matched_terms`、`contexts`（含 `source`、`section`、`matched_term`、`context`、`evidence_type`）。
 
-**Excel 批量**（`--input-xlsx`）：根对象额外包含元数据，例如 `source_file`、`sheet`、`name_column`、`row_count`、`drugs_run`、`top_n`、`context_window`、`dedupe_by_name`，以及 **`results`** 数组。`results` 中每一项通常含任务信息（如 `row_index`、`drug_name`）、`ok`（是否成功）、`error`（失败时的错误信息）、`result`（成功时为与单药结构相同的完整结果对象，否则 `null`）。
+**Excel 批量**（`--input-xlsx`）：根对象额外包含元数据，例如 `source_file`、`sheet`、`name_column`、`search_strategy`、`row_count`、`drugs_run`、`top_n`、`context_window`、`dedupe_by_name`，以及 **`results`** 数组。`results` 中每一项通常含任务信息（如 `row_index`、`drug_name`）、`ok`（是否成功）、`error`（失败时的错误信息）、`result`（成功时为与单药结构相同的完整结果对象，否则 `null`）。
 
 ---
 
@@ -230,7 +273,7 @@ bash scripts/run_example.sh
 - **Windows STDIO 报找不到文件（WinError 2）**：多为未安装 **Bun** 或未在 PATH 中，或 `MCP_SERVER_CWD` 路径错误。可改用 **`MCP_TRANSPORT=http`** 与 `MCP_SERVER_URL`，或改用 `MCP_SERVER_COMMAND=npx` + `MCP_SERVER_ARGS=-y,@cyanheads/pubmed-mcp-server@latest`（需 Node）。
 - **HTTP 4xx/5xx**：确认 URL 含 **`/mcp`**、防火墙与 TLS；可用公网测试 URL 对比是否为本地服务问题。
 - **全文为空或 `fulltext_available: false`**：常见于此文无开放全文或 JATS 段落为空；流水线仍保留摘要侧 `contexts`。
-- **检索无结果**：首条检索较严；会自动换策略（盐型后缀、`[Text Word]`、缩短 QT OR 块等）。查看 JSON 中 `query_attempts`、`query_strategy`。
+- **检索无结果**：`default` 下首条检索较严，会自动换策略（盐型后缀、`[Text Word]`、缩短 QT OR 块等）；查看 JSON 中 `query_attempts`、`query_strategy`。**`layered`** 下可看多轮 `query_attempts` 与 `layered_round`。
 - **额度**：配置 `NCBI_API_KEY` 与邮箱；遵守 [NCBI 使用政策](https://www.ncbi.nlm.nih.gov/account/settings/)。
 
 ---
