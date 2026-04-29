@@ -6,8 +6,6 @@ Tool names: pubmed_search_articles, pubmed_fetch_articles, pubmed_fetch_fulltext
 
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 import os
 import re
@@ -206,8 +204,3 @@ class PubMedMCPClient:
             {"pmcids": pmcids, "includeReferences": False},
         )
         return data if isinstance(data, dict) else {"articles": [], "totalReturned": 0}
-
-
-def run_async(coro):
-    """Run coroutine from sync code (stdlib policy for Windows + asyncio)."""
-    return asyncio.run(coro)

@@ -63,17 +63,10 @@ from .inference_features import concat_sections_text, extract_inference_features
 from .mcp_client import PubMedMCPClient
 
 from .query_builder import (
-
-    LAYERED_BROAD_MIN_UNION_TO_STOP,
-
-    LAYERED_STRICT_MIN_UNION_TO_SKIP_BROAD,
-
+    article_passes_min_relevance_tier,
     iter_layered_pubmed_query_rounds,
-
     iter_pubmed_query_fallbacks,
-
-    strip_salt_suffix,
-
+    tier_from_strategy_label,
 )
 
 from .report_writer import write_excel_batch_markdown, write_json, write_markdown_report
@@ -106,8 +99,9 @@ def _load_config(root: Path) -> dict:
 
     cfg["qt_terms"] = classifier_qt_terms_ordered()
 
-    return cfg
+    cfg.setdefault("evidence_filter_on_mesh_tiers", False)
 
+    return cfg
 
 
 
@@ -128,6 +122,12 @@ async def run_pipeline_for_drug(
 
     search_strategy: str = "default",
 
+    min_relevance_tier: str = "title",
+
+    max_articles_per_drug: int = 200,
+
+    evidence_filter_on_mesh_tiers: bool = False,
+
 ) -> dict:
 
     """One full pipeline using an existing MCP session (stdio or HTTP)."""
@@ -139,18 +139,23 @@ async def run_pipeline_for_drug(
     q_used = ""
     strategy_used = ""
     layered_round_used: str | None = None
-    loose_pmids: set[str] = set()
-    dn = drug.strip()
-    sb = strip_salt_suffix(dn)
-    base_for_loose: str | None = sb if sb and sb.lower() != dn.lower() else None
+    pmid_to_tier: dict[str, str] = {}
+    pmid_query_label: dict[str, str] = {}
+    pubmed_union_before_fetch_cap = 0
 
     if search_strategy == "layered":
         note_extra_layered = (
-            "Layered search: strict → broad → salt-stripped strict when applicable; "
-            "two branches per tier (hERG + QT TIAB) merged; "
-            f"broad skipped if union ≥ {LAYERED_STRICT_MIN_UNION_TO_SKIP_BROAD} PMIDs after strict; "
-            f"early exit after a tier when union ≥ that tier's min_hits_to_stop (broad: {LAYERED_BROAD_MIN_UNION_TO_STOP}). "
-            "PMC open full text when PMCID is present (same as default)."
+            "Layered search: topic tiers mesh_major → mesh → title → tiab (each merges "
+            "hERG/block + QT/TdP TIAB branches). May stop early when merged PMID count "
+            "meets the tier threshold (see query_builder.TIER_MIN_HITS_TO_STOP). "
+            f"Each sub-query uses maxResults={top_n} (CLI --top-n). "
+            f"Merged PMIDs are deduplicated; fetch uses at most {max_articles_per_drug} IDs "
+            "(CLI --max-articles-per-drug). PMC open full text when PMCID is present (same as default)."
+        )
+        per_query_cap = max(1, int(top_n))
+        log.info(
+            "Layered PubMed: effective maxResults per sub-query = %s (pubmed_search_articles)",
+            per_query_cap,
         )
         query_rounds = iter_layered_pubmed_query_rounds(drug)
         pmids_merged: list[str] = []
@@ -159,13 +164,17 @@ async def run_pipeline_for_drug(
 
         for qr in query_rounds:
             layered_round_used = qr.name
-            if qr.name == "salt_stripped_strict":
-                pmids_before_salt = set(seen_pmids)
             seen_round: set[str] = set()
             order_round: list[str] = []
             for label, q in qr.queries:
-                log.info("PubMed layered [%s/%s]: %s", qr.name, label, q)
-                s = await client.search_articles(q, top_n)
+                log.info(
+                    "PubMed layered [%s/%s] maxResults=%s: %s",
+                    qr.name,
+                    label,
+                    per_query_cap,
+                    q,
+                )
+                s = await client.search_articles(q, per_query_cap)
                 if not isinstance(s, dict):
                     s = {}
                 tf = int(s.get("totalFound") or 0)
@@ -183,23 +192,26 @@ async def run_pipeline_for_drug(
                 if eff and eff not in effective_parts:
                     effective_parts.append(eff)
                 for p in pmids_try:
-                    if p not in seen_round:
-                        seen_round.add(p)
-                        order_round.append(p)
+                    sp = str(p)
+                    if sp not in seen_round:
+                        seen_round.add(sp)
+                        order_round.append(sp)
+                        pmid_query_label.setdefault(sp, label)
             for p in order_round:
                 if p not in seen_pmids:
                     seen_pmids.add(p)
                     pmids_merged.append(p)
+                    pmid_to_tier[p] = qr.name
             strategy_used = f"layered:{qr.name}"
-            if qr.name == "salt_stripped_strict":
-                loose_pmids = set(seen_pmids) - pmids_before_salt
             if qr.min_hits_to_stop > 0 and len(pmids_merged) >= qr.min_hits_to_stop:
                 break
 
-        unique_union = len(pmids_merged)
         q_used = " | ".join(a["query"] for a in attempts_meta if a.get("query"))
-        pmids = pmids_merged[:top_n]
-        total_found = unique_union
+        union_n = len(pmids_merged)
+        pubmed_union_before_fetch_cap = union_n
+        fetch_cap = max(1, int(max_articles_per_drug))
+        pmids = pmids_merged[:fetch_cap]
+        total_found = union_n
         search = {
             "totalFound": total_found,
             "pmids": pmids,
@@ -207,14 +219,16 @@ async def run_pipeline_for_drug(
             "effectiveQuery": " ; ".join(effective_parts) if effective_parts else q_used,
         }
         log.info(
-            "Layered search: last_round=%s, union pmids=%s (after cap top_n=%s: %s)",
+            "Layered search: last_round=%s merged_union_pmids=%s fetch_cap=%s pmids_fetched=%s",
             layered_round_used,
-            unique_union,
-            top_n,
+            pubmed_union_before_fetch_cap,
+            fetch_cap,
             len(pmids),
         )
     else:
-        for label, q in iter_pubmed_query_fallbacks(drug):
+        fallbacks = list(iter_pubmed_query_fallbacks(drug))
+        first_fb_label = fallbacks[0][0] if fallbacks else ""
+        for label, q in fallbacks:
             log.info("PubMed try [%s]: %s", label, q)
             search = await client.search_articles(q, top_n)
             if not isinstance(search, dict):
@@ -231,8 +245,13 @@ async def run_pipeline_for_drug(
             )
             q_used, strategy_used = q, label
             if tf > 0 and pmids_try:
-                if label != "ta_quoted":
+                if label != first_fb_label:
                     log.info("PubMed: hits after broader strategy %s (total=%s)", label, tf)
+                tier_fb = tier_from_strategy_label(label)
+                for p in pmids_try:
+                    sp = str(p)
+                    pmid_to_tier[sp] = tier_fb
+                    pmid_query_label[sp] = label
                 break
 
     note: str | None = None
@@ -256,6 +275,7 @@ async def run_pipeline_for_drug(
     if search_strategy != "layered":
         pmids = [str(p) for p in (search.get("pmids") or []) if p]
         total_found = int(search.get("totalFound") or 0)
+        pubmed_union_before_fetch_cap = len(pmids)
     log.info("Found total=%s, retrieved pmids=%s (strategy=%s)", total_found, len(pmids), strategy_used)
 
 
@@ -332,6 +352,8 @@ async def run_pipeline_for_drug(
 
         row = {k: v for k, v in a.items() if k != "sections"}
 
+        row["pmc_body_available"] = bool(a.get("fulltext_available")) and bool(sections)
+
         row["matched_terms"] = ex.get("matched_terms") or []
 
         row["contexts"] = ex.get("contexts") or []
@@ -342,11 +364,15 @@ async def run_pipeline_for_drug(
 
         row.pop("error", None)
 
+        pmid_k = str(row.get("pmid") or "")
+        row["tier"] = pmid_to_tier.get(pmid_k, "tiab")
+        row["pubmed_query_label"] = pmid_query_label.get(pmid_k, "")
+
         enrich_article_evidence_metadata(
             row,
             drug,
-            loose_match=str(row.get("pmid") or "") in loose_pmids,
-            base_name=base_for_loose,
+            loose_match=False,
+            base_name=None,
         )
 
         sec_blob = concat_sections_text(sections)
@@ -369,7 +395,25 @@ async def run_pipeline_for_drug(
 
     articles_before_evidence_filter = len(final_arts)
 
-    final_arts = filter_articles(final_arts, drug)
+    final_arts = filter_articles(
+        final_arts,
+        drug,
+        evidence_filter_on_mesh_tiers=evidence_filter_on_mesh_tiers,
+    )
+
+    articles_after_evidence_filter_only = len(final_arts)
+
+    low_confidence_articles = [
+        a
+        for a in final_arts
+        if not article_passes_min_relevance_tier(str(a.get("tier") or ""), min_relevance_tier)
+    ]
+    final_arts = [
+        a
+        for a in final_arts
+        if article_passes_min_relevance_tier(str(a.get("tier") or ""), min_relevance_tier)
+    ]
+
     with_ft = sum(1 for a in final_arts if a.get("fulltext_available"))
 
     with_ctx = sum(1 for a in final_arts if a.get("contexts"))
@@ -394,13 +438,25 @@ async def run_pipeline_for_drug(
 
         "layered_round": layered_round_used,
 
+        "min_relevance_tier": min_relevance_tier,
+
+        "max_articles_per_drug": max_articles_per_drug,
+
+        "evidence_filter_on_mesh_tiers": evidence_filter_on_mesh_tiers,
+
         "summary": {
 
             "total_pubmed_articles": len(pmids),
 
+            "pubmed_pmids_union_before_fetch_cap": pubmed_union_before_fetch_cap,
+
             "articles_before_evidence_filter": articles_before_evidence_filter,
 
-            "articles_after_evidence_filter": len(final_arts),
+            "articles_after_evidence_filter": articles_after_evidence_filter_only,
+
+            "articles_below_min_relevance_tier": len(low_confidence_articles),
+
+            "articles_after_min_relevance_tier": len(final_arts),
 
             "articles_with_pmcid": len(with_pmc),
 
@@ -414,13 +470,24 @@ async def run_pipeline_for_drug(
 
         "articles": final_arts,
 
+        "low_confidence_articles": low_confidence_articles,
+
     }
 
 
 
 
 
-async def _run_one_drug(drug: str, top_n: int, window: int, *, search_strategy: str) -> dict:
+async def _run_one_drug(
+    drug: str,
+    top_n: int,
+    window: int,
+    *,
+    search_strategy: str,
+    min_relevance_tier: str,
+    max_articles_per_drug: int,
+    strict_evidence_filter_mesh_tiers: bool,
+) -> dict:
 
     root = _project_root()
 
@@ -430,10 +497,22 @@ async def _run_one_drug(drug: str, top_n: int, window: int, *, search_strategy: 
 
     terms = [str(x) for x in (cfg.get("qt_terms") or [])]
 
+    evidence_filter_on_mesh_tiers = bool(cfg.get("evidence_filter_on_mesh_tiers", False))
+    if strict_evidence_filter_mesh_tiers:
+        evidence_filter_on_mesh_tiers = True
+
     async with PubMedMCPClient.from_env(root) as client:
 
         return await run_pipeline_for_drug(
-            client, drug, top_n, window, terms, search_strategy=search_strategy
+            client,
+            drug,
+            top_n,
+            window,
+            terms,
+            search_strategy=search_strategy,
+            min_relevance_tier=min_relevance_tier,
+            max_articles_per_drug=max_articles_per_drug,
+            evidence_filter_on_mesh_tiers=evidence_filter_on_mesh_tiers,
         )
 
 
@@ -460,6 +539,12 @@ async def _run_excel_batch(
 
     search_strategy: str,
 
+    min_relevance_tier: str,
+
+    max_articles_per_drug: int,
+
+    strict_evidence_filter_mesh_tiers: bool,
+
 ) -> dict:
 
     root = _project_root()
@@ -469,6 +554,10 @@ async def _run_excel_batch(
     cfg = _load_config(root)
 
     terms = [str(x) for x in (cfg.get("qt_terms") or [])]
+
+    evidence_filter_on_mesh_tiers = bool(cfg.get("evidence_filter_on_mesh_tiers", False))
+    if strict_evidence_filter_mesh_tiers:
+        evidence_filter_on_mesh_tiers = True
 
 
 
@@ -498,6 +587,15 @@ async def _run_excel_batch(
 
     log.info("Excel rows: %s, jobs to run: %s (dedupe=%s)", n_rows, len(jobs), dedupe_by_name)
 
+    if search_strategy == "layered":
+        log.info(
+            "Effective top_n per sub-query (pubmed_search_articles maxResults): %s",
+            max(1, int(top_n)),
+        )
+        log.info(
+            "Effective max merged PMIDs fetched per drug (max_articles_per_drug): %s",
+            max(1, int(max_articles_per_drug)),
+        )
 
 
     async with PubMedMCPClient.from_env(root) as client:
@@ -509,7 +607,15 @@ async def _run_excel_batch(
             try:
 
                 r = await run_pipeline_for_drug(
-                    client, name, top_n, window, terms, search_strategy=search_strategy
+                    client,
+                    name,
+                    top_n,
+                    window,
+                    terms,
+                    search_strategy=search_strategy,
+                    min_relevance_tier=min_relevance_tier,
+                    max_articles_per_drug=max_articles_per_drug,
+                    evidence_filter_on_mesh_tiers=evidence_filter_on_mesh_tiers,
                 )
 
                 results.append({**j, "ok": True, "error": None, "result": r})
@@ -543,6 +649,12 @@ async def _run_excel_batch(
         "context_window": window,
 
         "dedupe_by_name": dedupe_by_name,
+
+        "min_relevance_tier": min_relevance_tier,
+
+        "max_articles_per_drug": max_articles_per_drug,
+
+        "evidence_filter_on_mesh_tiers": evidence_filter_on_mesh_tiers,
 
         "results": results,
 
@@ -607,9 +719,38 @@ def _parse_args() -> argparse.Namespace:
 
     )
 
-    p.add_argument("--top-n", type=int, default=20, dest="top_n", help="Max PubMed results per drug (default 20)")
+    p.add_argument(
+        "--top-n",
+        type=int,
+        default=20,
+        dest="top_n",
+        help="PubMed maxResults per sub-query / single-strategy search (default 20).",
+    )
+
+    p.add_argument(
+        "--max-articles-per-drug",
+        type=int,
+        default=200,
+        dest="max_articles_per_drug",
+        help=(
+            "After PubMed tier/branch merge, fetch metadata for at most this many PMIDs per drug "
+            "(default 200). Separate from --top-n."
+        ),
+    )
+
+    p.add_argument(
+        "--strict-evidence-filter-on-mesh-tiers",
+        action="store_true",
+        dest="strict_evidence_filter_mesh_tiers",
+        help=(
+            "Require keyword/MESH vocabulary overlap for mesh_major/mesh tiers too "
+            "(default: trust PubMed MeSH; override config qt_keywords.yaml)."
+        ),
+    )
 
     p.add_argument("--window", type=int, default=500, help="Context character window (default 500)")
+
+
 
     p.add_argument(
 
@@ -688,11 +829,25 @@ def _parse_args() -> argparse.Namespace:
         dest="search_strategy",
 
         help=(
-            "PubMed query mode: default (single QT_OR + fallbacks) "
-            "or layered (strict→broad→salt tiers, two branches each, early stop). "
+            "PubMed query mode: default (tiered mesh_major→mesh→title→tiab fallbacks, "
+            "two branches each) "
+            "or layered (same tiers merged per round; optional early stop via "
+            "min_hits_to_stop). "
             "Both fetch PMC open full text when PMCID is available."
         ),
 
+    )
+
+    p.add_argument(
+        "--min-relevance-tier",
+        type=str,
+        choices=["mesh_major", "mesh", "title", "tiab"],
+        default="title",
+        dest="min_relevance_tier",
+        help=(
+            "Exclude articles whose PubMed retrieval tier is below this threshold "
+            "(mesh_major > mesh > title > tiab). Default title removes tiab-only hits."
+        ),
     )
 
     return p.parse_args()
@@ -772,7 +927,13 @@ def main() -> int:
 
             data = asyncio.run(
                 _run_one_drug(
-                    drug, int(args.top_n), int(args.window), search_strategy=args.search_strategy
+                    drug,
+                    int(args.top_n),
+                    int(args.window),
+                    search_strategy=args.search_strategy,
+                    min_relevance_tier=args.min_relevance_tier,
+                    max_articles_per_drug=int(args.max_articles_per_drug),
+                    strict_evidence_filter_mesh_tiers=args.strict_evidence_filter_mesh_tiers,
                 )
             )
 
@@ -822,7 +983,8 @@ def main() -> int:
 
             f"articles in: {s.get('articles_before_evidence_filter', 0)}  "
 
-            f"articles kept: {s.get('articles_after_evidence_filter', 0)}  "
+            f"articles after relevance filter: {s.get('articles_after_evidence_filter', 0)}  "
+            f"exported (after min tier): {s.get('articles_after_min_relevance_tier', s.get('articles_after_evidence_filter', 0))}  "
 
             f"subtypes assigned: {nsub}  "
 
@@ -886,6 +1048,12 @@ def main() -> int:
 
                 search_strategy=args.search_strategy,
 
+                min_relevance_tier=args.min_relevance_tier,
+
+                max_articles_per_drug=int(args.max_articles_per_drug),
+
+                strict_evidence_filter_mesh_tiers=args.strict_evidence_filter_mesh_tiers,
+
             )
 
         )
@@ -946,7 +1114,9 @@ def main() -> int:
 
         ain += int(summ.get("articles_before_evidence_filter", 0))
 
-        akept += int(summ.get("articles_after_evidence_filter", 0))
+        akept += int(
+            summ.get("articles_after_min_relevance_tier", summ.get("articles_after_evidence_filter", 0))
+        )
 
         for art in res.get("articles") or []:
 

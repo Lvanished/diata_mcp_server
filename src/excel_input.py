@@ -48,16 +48,6 @@ def resolve_sheet(
     return name, df
 
 
-def load_drug_table(
-    xlsx_path: str | Path,
-    *,
-    sheet: str | int | None = 0,
-    name_column: str = "name",
-) -> pd.DataFrame:
-    _, df = resolve_sheet(xlsx_path, sheet)
-    return df
-
-
 def build_drug_jobs(
     df: pd.DataFrame,
     *,

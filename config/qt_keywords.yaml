@@ -2,4 +2,7 @@
 # Keep this file for optional future YAML-only overrides if needed.
 qt_terms: []
 
+# When false (default), mesh_major/mesh-tier articles skip abstract-only keyword gate (PubMed already constrained MeSH).
+evidence_filter_on_mesh_tiers: false
+
 search_terms: []

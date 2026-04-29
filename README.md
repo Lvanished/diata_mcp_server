@@ -76,7 +76,6 @@ pubmed_pmc_drug_context_agent/
 │   ├── context_extractor.py  # 摘要+全文中关键词窗口；matched_terms；evidence_type
 │   ├── excel_input.py        # 读 xlsx；按列构建去重/不去重任务列表
 │   ├── report_writer.py      # 写 JSON、单药 Markdown、批量汇总 Markdown
-│   ├── schemas.py            # Pydantic 模型（报告结构辅助，可选校验）
 │   └── __init__.py
 └── outputs/                  # 默认输出目录（可用 --out-dir 修改）
 ```
@@ -85,13 +84,12 @@ pubmed_pmc_drug_context_agent/
 
 - **`main.py`**：解析参数、加载 `qt_keywords.yaml`、建立 MCP 会话、对单个或批量药名执行 `run_pipeline_for_drug`、写输出文件。
 - **`mcp_client.py`**：根据 `MCP_TRANSPORT` 选择 `streamable_http_client` 或 `stdio_client`；解析工具返回 JSON；仅暴露 `search_articles` / `fetch_articles` / `fetch_fulltext_pmc`。
-- **`query_builder.py`**：生成 PubMed 检索式。`default`：药名 + QT/复极化 OR 块与多种 fallback；`layered`：分层轮次（strict / broad / 去盐 strict），每轮两条分支（hERG+通道阻断词、QT/TdP 且限定 Title/Abstract），详见源码中 `QueryRound` 与 `build_herg_query` / `build_qt_query`。
+- **`query_builder.py`**：生成 PubMed 检索式；`default` 与 `layered` 下的 tier / fallback 见源码 `QueryRound`、`build_herg_query` / `build_qt_query`。
 - **`article_filter.py`**：统一文章字段；筛选带 PMCID 的记录供全文步骤使用。
 - **`fulltext_extractor.py`**：调用 MCP 全文工具并与元数据合并；**不**做 QT 关键词匹配。
 - **`context_extractor.py`**：在摘要与全文段落中匹配 `qt_keywords.yaml`；产出 `matched_terms`、`contexts` 及 `evidence_type`。
 - **`excel_input.py`**：从 Excel 读取药名列，支持 `--max-drugs`、`--no-dedupe`。
 - **`report_writer.py`**：序列化结果到 JSON/Markdown。
-- **`schemas.py`**：与报告字段一致的数据模型定义。
 
 **`scripts/`：**
 
@@ -123,8 +121,8 @@ pubmed_pmc_drug_context_agent/
 
 ### 5.1 设计动机
 
-- **`default`**：一条较宽的「药名 + QT/复极化 OR 块」，无命中时再**纵向**换盐型、`[Text Word]`、缩短 OR 等 fallback。
-- **`layered`（新策略）**：把文献需求拆成两条**可解释**的 PubMed 轴，再按**严格 → 放宽 → 去盐后再严格**逐级尝试；每层内在 PMID 层面**并集**，命中足够则**提前结束**后续层，减少无谓的宽泛检索。
+- **`default`**：`iter_pubmed_query_fallbacks` — **药名主题阶梯**（`mesh_major` → `mesh` → `title` → `tiab`），每层两条分支（hERG/block + QT/TdP TIAB），遇首个有命中的分支即停止（纵向 fallback）；药名默认会做**去盐**规范化后再组式。
+- **`layered`**：同一阶梯与分支形状，但在每一 **tier** 内合并两条分支的 PMID；**每条子检索（`__herg` / `__qt`）的 `maxResults` 均等于 CLI `--top-n`**（不再按 tier 拆分预算）。合并后的 PMID 数达到该 tier 的 `min_hits_to_stop`（见 `query_builder.TIER_MIN_HITS_TO_STOP`）时可**提前结束**后续 tier。
 
 适用于希望 **hERG/通道机制** 与 **QT/TdP 临床/表型** 在检索上分离、且 QT 侧希望**主要锚定在标题/摘要** 的场景。
 
@@ -132,8 +130,8 @@ pubmed_pmc_drug_context_agent/
 
 | 分支 | 逻辑概要 | 说明 |
 |------|------------|------|
-| **A（hERG / IKr 轴）** | `药名[Title/Abstract]` **且** `(hERG \| KCNH2 \| ether-a-go-go \| IKr)` **且**「阻断/抑制/通道/current」类词 | 通道相关词在检索式中**不限定 [Title/Abstract]**，以便 Title、Abstract、MeSH 等字段与 PubMed 惯例一致。strict / broad 两档差别主要在阻断侧词表宽窄（见 `build_herg_query(..., broad=...)`）。 |
-| **B（QT / TdP 轴）** | `药名[Title/Abstract]` **且** 一串 **仅作用于 Title/Abstract** 的 QT 延长、长 QT、TdP、proarrhythmia 等短语 | 不要求一篇文献**同时**满足 A 与 B：本层 PMID 集合为 **A 的命中的 PMID ∪ B 的 PMID**（客户端去重合并，通常先保留 A 的顺序再追加 B 的新 PMID）。 |
+| **A（hERG / IKr 轴）** | **药名主题子句**（按 tier：`MeSH Major Topic`/Pharmacological Action → MeSH Terms → `[Title]` → `[Title/Abstract]`）**且** `(hERG \| KCNH2 \| …)` **且**「阻断/抑制/通道/current」类词 | 通道与阻断词通常用裸词 OR（不限定 TIAB），与 `build_herg_query(..., tier=...)` 一致；`broad` 参数保留 API 兼容性，分层默认 `broad=False`。 |
+| **B（QT / TdP 轴）** | **同一药名主题子句** **且** 一串 **仅作用于 Title/Abstract** 的 QT 延长、长 QT、TdP 等短语 | 不要求一篇文献**同时**满足 A 与 B：本 tier PMID 集合为 **A ∪ B**（客户端去重合并）。 |
 
 每一**层（tier）**都会跑完当前层配置下的 **A + B**，再根据合并后的唯一 PMID 数决定是否进入下一层。
 
@@ -141,20 +139,21 @@ pubmed_pmc_drug_context_agent/
 
 源码中 `iter_layered_pubmed_query_rounds` 默认顺序为：
 
-1. **`strict`**：两分支均用**较窄**关键词（`build_*Query(..., broad=False)`）。
-2. **`broad`**：同一药名，两分支改为 **broad=True**（更多 TdP、channel/current、宽 block 等同义词）。
-3. **`salt_stripped_strict`**：仅当 `strip_salt_suffix(药名)` 与原名**字面不同**时再跑一轮，且两分支均为 **strict**（去盐后往往更接近题录常用名）。
+1. **`mesh_major`**：药名为 MeSH Major Topic 或 Pharmacological Action（最高精度）。
+2. **`mesh`**：药名出现在任意 MeSH Terms 或 Pharmacological Action。
+3. **`title`**：药名出现在 `[Title]`（近年或未索引文献）。
+4. **`tiab`**：药名在 Title 或 Abstract（末级召回）。
 
-每层带有 `min_hits_to_stop`（默认 **1**）：若本层合并后的唯一 PMID 数 **≥ 该阈值**，则**不再执行**更靠后的轮次。轮次名称会写入结果中的 `layered_round`、`query_attempts[].round` 等字段。
+每层带有 `min_hits_to_stop`（见 `query_builder.TIER_MIN_HITS_TO_STOP`，MeSH/title 多为 **3**，`tiab` 为 **1**）：若本层合并后的唯一 PMID 数 **≥ 该阈值**，则**不再执行**更靠后的 tier。轮次名称会写入结果中的 `layered_round`、`query_attempts[].round` 等字段。
 
 ### 5.4 与 `default` 的对比小结
 
 | 维度 | `default` | `layered` |
 |------|-----------|-----------|
-| 主检索形状 | 单式 + 多条 fallback 链 | 每层 **2 条**检索式并集 + **多轮** tier |
-| QT 相关短语 | 与同 OR 块中药名组合，字段策略与 `query_builder._or_block` 一致 | 独立分支 B，**显式限定在 Title/Abstract** |
-| hERG/通道 | 含在大 OR 中 | 独立分支 A，并可与「阻断/通道」词 AND |
-| 无结果时 | 换盐型、Text Word、缩短 OR | 换 tier（broad、去盐 strict） |
+| 主检索形状 | 纵向尝试同一阶梯上的分支（遇首个命中即停） | 每层 **2 条**检索式并集 + **多轮** tier；每条子查询 `maxResults = --top-n` |
+| QT 相关短语 | `build_pubmed_query` 等为宽 TIAB OR 块（视入口而定） | 分支 B：**显式限定在 Title/Abstract** |
+| hERG/通道 | 视入口（可与 QT 同一大 OR 块） | 独立分支 A，与「阻断/通道」词 AND |
+| 无结果时 | 继续下一分支 / 下一 tier | 继续下一 tier，或在达到 `min_hits_to_stop` 时提前结束 |
 
 ### 5.5 启用方式与输出
 
@@ -235,8 +234,8 @@ python -m src.main --drug "thioridazine" --top-n 20
 
 | 取值 | 说明 |
 |------|------|
-| **`default`**（默认） | 药名 `[Title/Abstract]` + 较宽的 QT/复极化 OR 块；无结果时自动换盐型、`[Text Word]`、缩短 QT 子等 fallback（`iter_pubmed_query_fallbacks`）。 |
-| **`layered`** | **分层检索**：按顺序执行 `strict` → `broad`（可选）→ `salt_stripped_strict`（药名去盐后若与原名不同）。每一层内对两条检索式 **合并 PMID**（hERG/通道相关 + QT 短语且 **QT 侧限定 Title/Abstract**）；当本层合并后的唯一 PMID 数 ≥ `min_hits_to_stop`（默认 1）时，不再跑后续层。有 PMCID 时仍会拉 **PMC 开放全文**（与 `default` 一致）。 |
+| **`default`**（默认） | `iter_pubmed_query_fallbacks`：**mesh_major → mesh → title → tiab**，每层先试 **hERG** 分支再 **QT** 分支；遇首个返回 PMID 的分支即停止纵向尝试（药名默认去盐后再组式）。 |
+| **`layered`** | **分层检索**：同上阶梯与分支，但每层 **合并** 两条分支的 PMID；**每条子检索 `maxResults` = `--top-n`**；合并 PMID 数 ≥ 该 tier 的 `min_hits_to_stop` 时可提前结束后续 tier。合并后的 PMID 列表仍按每药 **`top-n`** 截断后再 fetch。有 PMCID 时仍会拉 **PMC 开放全文**（与 `default` 一致）。 |
 
 启用分层示例：
 

@@ -5,7 +5,11 @@ Filters articles to those with a PMCID and normalizes fields for downstream step
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
+
+from .qt_vocabulary import classifier_qt_terms_ordered
+from .query_builder import strip_salt_suffix
 
 
 def _pipeline_evidence_flags(article: dict[str, Any]) -> tuple[bool, bool, bool]:
@@ -54,12 +58,43 @@ def loose_match_strength(
     return "fulltext_only"
 
 
+def _fold_case(s: str) -> str:
+    """Unicode-normalize + case-fold so METHADONE / methadone / stray combining chars align."""
+    return unicodedata.normalize("NFKD", s or "").casefold()
+
+
+def _drug_name_variants(drug_name: str) -> list[str]:
+    """Return case-folded, salt-stripped variants of the drug name (deduped, ≥2 chars)."""
+    raw = (drug_name or "").strip()
+    if not raw:
+        return []
+    variants = {_fold_case(raw), _fold_case(strip_salt_suffix(raw))}
+    first_token = _fold_case(raw.split()[0]) if raw.split() else ""
+    if first_token:
+        variants.add(first_token)
+    out = [v for v in variants if v and len(v) >= 2]
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for v in out:
+        if v not in seen:
+            seen.add(v)
+            uniq.append(v)
+    return uniq
+
+
+def _contains_any_variant(text: str, variants: list[str]) -> bool:
+    blob = _fold_case(text or "")
+    return any(v in blob for v in variants)
+
+
 def drug_in_title_abstract(drug_name: str, article: dict[str, Any]) -> bool:
-    drug = (drug_name or "").strip()
-    if not drug:
+    """Whether drug name variants appear in title, abstract, or MeSH descriptor blob."""
+    variants = _drug_name_variants(drug_name)
+    if not variants:
         return False
-    ta = f"{article.get('title') or ''}\n{article.get('abstract') or ''}"
-    return bool(re.search(re.escape(drug), ta, flags=re.I))
+    mesh_blob = " ".join(article.get("mesh_terms") or [])
+    blob = f"{article.get('title') or ''}\n{article.get('abstract') or ''}\n{mesh_blob}"
+    return _contains_any_variant(blob, variants)
 
 
 def enrich_article_evidence_metadata(
@@ -90,6 +125,32 @@ def enrich_article_evidence_metadata(
         article.pop("loose_match_strength", None)
 
 
+def _mesh_terms_overlap_classifier_vocab(article: dict[str, Any]) -> bool:
+    """True when indexed MeSH descriptor text overlaps classifier QT/hERG vocabulary (strict mesh tier aid)."""
+    mesh_txt = " ".join(article.get("mesh_terms") or [])
+    if not mesh_txt.strip():
+        return False
+    blob = mesh_txt.lower()
+    for t in classifier_qt_terms_ordered():
+        tl = str(t).lower().strip()
+        if len(tl) >= 3 and tl in blob:
+            return True
+    return False
+
+
+def _passes_keyword_evidence_gate(
+    article: dict[str, Any],
+    *,
+    evidence_filter_on_mesh_tiers: bool,
+) -> bool:
+    tier = str(article.get("tier") or "tiab")
+    if tier in ("mesh_major", "mesh") and not evidence_filter_on_mesh_tiers:
+        return True
+    if tier in ("mesh_major", "mesh") and evidence_filter_on_mesh_tiers:
+        return _is_likely_relevant(article) or _mesh_terms_overlap_classifier_vocab(article)
+    return _is_likely_relevant(article)
+
+
 def _is_likely_relevant(article: dict[str, Any]) -> bool:
     """
     Drop articles with neither keyword context nor any pipeline evidence label.
@@ -107,13 +168,29 @@ def _is_likely_relevant(article: dict[str, Any]) -> bool:
     return False
 
 
-def filter_articles(articles: list[dict[str, Any]], drug_name: str) -> list[dict[str, Any]]:
+def filter_articles(
+    articles: list[dict[str, Any]],
+    drug_name: str,
+    *,
+    evidence_filter_on_mesh_tiers: bool = False,
+) -> list[dict[str, Any]]:
     """
-    Post-filter using ``_is_likely_relevant``. Requires ``enrich_article_evidence_metadata`` first.
+    Post-filter keyword/context relevance.
+
+    ``mesh_major`` / ``mesh`` tiers: PubMed query already constrained drugs via MeSH; when
+    ``evidence_filter_on_mesh_tiers`` is False (default), skip abstract keyword gating.
+
+    ``title`` / ``tiab``: always use keyword/context gate.
+
+    Requires ``enrich_article_evidence_metadata`` first (sets contexts / pipeline flags).
     ``drug_name`` is accepted for API symmetry.
     """
     del drug_name
-    return [a for a in articles if _is_likely_relevant(a)]
+    return [
+        a
+        for a in articles
+        if _passes_keyword_evidence_gate(a, evidence_filter_on_mesh_tiers=evidence_filter_on_mesh_tiers)
+    ]
 
 
 def _as_str(x: Any) -> str:

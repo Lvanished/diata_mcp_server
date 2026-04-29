@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-
 def write_json(data: Any, output_path: str | Path) -> None:
     p = Path(output_path)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -24,13 +23,28 @@ def _summary_lines(payload: dict[str, Any]) -> list[str]:
     s = payload.get("summary") or {}
     before_f = s.get("articles_before_evidence_filter")
     before_s = str(before_f) if before_f is not None else "—"
+    af_ev = s.get("articles_after_evidence_filter")
+    af_ev_s = str(af_ev) if af_ev is not None else "—"
     lines = [
         f"- Total PubMed articles (retrieved): {s.get('total_pubmed_articles', 0)}",
-        f"- After relevance filter (before → after): {before_s} → {s.get('articles_after_evidence_filter', 0)}",
-        f"- Articles with PMCID: {s.get('articles_with_pmcid', 0)}",
-        f"- Articles with fulltext: {s.get('articles_with_fulltext', 0)}",
-        f"- Articles with QT-related context: {s.get('articles_with_context', 0)}",
+        f"- After relevance filter (before → after): {before_s} → {af_ev_s}",
     ]
+    am = s.get("articles_after_min_relevance_tier")
+    below = s.get("articles_below_min_relevance_tier")
+    if am is not None:
+        mrt = payload.get("min_relevance_tier") or ""
+        suf = f" (`min_relevance_tier={mrt}`)" if mrt else ""
+        extra = ""
+        if below:
+            extra = f" — below-tier excluded from export: {below}"
+        lines.append(f"- After min relevance tier{suf}: exported {am}{extra}")
+    lines.extend(
+        [
+            f"- Articles with PMCID: {s.get('articles_with_pmcid', 0)}",
+            f"- Articles with fulltext: {s.get('articles_with_fulltext', 0)}",
+            f"- Articles with QT-related context: {s.get('articles_with_context', 0)}",
+        ]
+    )
     return lines
 
 
@@ -83,6 +97,9 @@ def write_markdown_report(data: dict[str, Any], output_path: str | Path) -> None
     lines.append("")
 
     lines.append("## Summary")
+    if data.get("min_relevance_tier"):
+        lines.append(f"- Min relevance tier (PubMed): `{data['min_relevance_tier']}`")
+        lines.append("")
     for row in _summary_lines(data):
         lines.append(row)
     lines.append("")
@@ -94,7 +111,13 @@ def write_markdown_report(data: dict[str, Any], output_path: str | Path) -> None
         lines.append("")
         lines.append(f"### {i}. {title}")
         lines.append(f"- PMID: {a.get('pmid', '')}")
+        if a.get("tier"):
+            lines.append(f"- PubMed retrieval tier: {a.get('tier')}")
         lines.append(f"- PMCID: {a.get('pmcid', '')}")
+        lines.append(
+            f"- PMC body available (是否拿到 PMC 正文): "
+            f"{a.get('pmc_body_available', a.get('fulltext_available', False))}"
+        )
         lines.append(f"- Journal: {a.get('journal', '')}")
         lines.append(f"- Year: {a.get('year', '')}")
         lines.append(f"- Matched terms: {', '.join(a.get('matched_terms') or [])}")
@@ -143,7 +166,8 @@ def write_excel_batch_markdown(payload: dict[str, Any], output_path: str | Path)
         "",
         f"**Source:** `{payload.get('source_file', '')}`",
         f"**Sheet:** `{payload.get('sheet', '')}` · **name column:** `{payload.get('name_column', '')}`",
-        f"**Search strategy:** `{payload.get('search_strategy', 'default')}`",
+        f"**Search strategy:** `{payload.get('search_strategy', 'default')}` · "
+        f"**min_relevance_tier:** `{payload.get('min_relevance_tier', 'title')}`",
         f"**Drugs in file / run:** {payload.get('row_count', 0)} / {payload.get('drugs_run', 0)}",
         "",
         "| # | row | drug | PubChem | PubMed n | PMCID n | fulltext n | context art. | error |",
@@ -155,7 +179,8 @@ def write_excel_batch_markdown(payload: dict[str, Any], output_path: str | Path)
         pid = str(item.get("pubchem_id", "")) if item.get("pubchem_id") is not None else ""
         if item.get("error"):
             lines.append(
-                f"| {i} | {j} | {name} | {pid} | — | — | — | — | {str(item.get('error'))[:80]} |"
+                f"| {i} | {j} | {name} | {pid} | — | — | — | — | "
+                f"{str(item.get('error'))[:80]} |"
             )
             continue
         r = item.get("result") or {}
@@ -164,6 +189,7 @@ def write_excel_batch_markdown(payload: dict[str, Any], output_path: str | Path)
         lines.append(
             f"| {i} | {j} | {name} | {pid} | "
             f"{s.get('total_pubmed_articles', 0)} | {s.get('articles_with_pmcid', 0)} | "
-            f"{s.get('articles_with_fulltext', 0)} | {s.get('articles_with_context', 0)} | {err} |"
+            f"{s.get('articles_with_fulltext', 0)} | {s.get('articles_with_context', 0)} | "
+            f"{err} |"
         )
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
