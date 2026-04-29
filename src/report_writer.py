@@ -22,12 +22,16 @@ def write_json(data: Any, output_path: str | Path) -> None:
 
 def _summary_lines(payload: dict[str, Any]) -> list[str]:
     s = payload.get("summary") or {}
-    return [
-        f"- Total PubMed articles: {s.get('total_pubmed_articles', 0)}",
+    before_f = s.get("articles_before_evidence_filter")
+    before_s = str(before_f) if before_f is not None else "—"
+    lines = [
+        f"- Total PubMed articles (retrieved): {s.get('total_pubmed_articles', 0)}",
+        f"- After relevance filter (before → after): {before_s} → {s.get('articles_after_evidence_filter', 0)}",
         f"- Articles with PMCID: {s.get('articles_with_pmcid', 0)}",
         f"- Articles with fulltext: {s.get('articles_with_fulltext', 0)}",
         f"- Articles with QT-related context: {s.get('articles_with_context', 0)}",
     ]
+    return lines
 
 
 def write_markdown_report(data: dict[str, Any], output_path: str | Path) -> None:
@@ -94,6 +98,14 @@ def write_markdown_report(data: dict[str, Any], output_path: str | Path) -> None
         lines.append(f"- Journal: {a.get('journal', '')}")
         lines.append(f"- Year: {a.get('year', '')}")
         lines.append(f"- Matched terms: {', '.join(a.get('matched_terms') or [])}")
+        if "drug_in_title_abstract" in a:
+            lines.append(
+                f"- Audit: drug_in_title_abstract={a.get('drug_in_title_abstract')}, "
+                f"loose_match={a.get('loose_match')}, "
+                f"clinical_QT_evidence={a.get('pipeline_clinical_qt_evidence')}, "
+                f"mechanistic_evidence={a.get('pipeline_mechanistic_evidence')}, "
+                f"phenotypic_evidence={a.get('pipeline_phenotypic_evidence')}"
+            )
         if a.get("fulltext_error"):
             lines.append(f"- Fulltext: {a.get('fulltext_error')}")
         else:

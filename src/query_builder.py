@@ -7,6 +7,17 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from .qt_vocabulary import (
+    BLOCK_ACTION_TERMS_BROAD,
+    BLOCK_ACTION_TERMS_STRICT,
+    CLINICAL_QT_TERMS,
+    MECH_HERG_TERMS,
+    PHENOTYPIC_TERMS,
+    quote_for_pubmed,
+    or_join_bare,
+    or_join_tiab,
+)
+
 
 def _clean_drug_name(drug_name: str) -> str:
     s = (drug_name or "").strip()
@@ -34,18 +45,15 @@ def strip_salt_suffix(drug_name: str) -> str:
 
 
 def _or_block() -> str:
-    return " OR ".join(
-        [
-            '"QT prolongation"[Title/Abstract]',
-            '"long QT"[Title/Abstract]',
-            '"torsades de pointes"[Title/Abstract]',
-            "hERG[Title/Abstract]",
-            "IKr[Title/Abstract]",
-            "repolarization[Title/Abstract]",
-            "APD[Title/Abstract]",
-            "FPD[Title/Abstract]",
-        ]
-    )
+    """PubMed OR clause aligned with classifier vocabulary (TIAB)."""
+    parts: list[str] = []
+    for t in CLINICAL_QT_TERMS:
+        parts.append(f"{quote_for_pubmed(t)}[Title/Abstract]")
+    for t in MECH_HERG_TERMS:
+        parts.append(f"{quote_for_pubmed(t)}[Title/Abstract]")
+    for t in PHENOTYPIC_TERMS:
+        parts.append(f"{quote_for_pubmed(t)}[Title/Abstract]")
+    return " OR ".join(parts)
 
 
 def build_pubmed_query(
@@ -70,7 +78,6 @@ def build_pubmed_query(
     if quote_drug:
         drug_quoted = f'"{drug}"'
     else:
-        # Single-token drugs sometimes appear unquoted in PubMed; avoid breaking multiword.
         drug_quoted = f'"{drug}"' if " " in drug else drug
     or_block = _or_block()
     return f"({drug_quoted}{tag}) AND ({or_block})"
@@ -107,34 +114,14 @@ def iter_pubmed_query_fallbacks(drug_name: str) -> list[tuple[str, str]]:
     if base and base.lower() != drug.lower():
         add("tw_quoted_salt_stripped", build_pubmed_query(base, drug_field="Text Word", quote_drug=True))
 
-    minimal = (
-        f'("{drug}"[Title/Abstract]) AND ('
-        '"QT prolongation"[Title/Abstract] OR "long QT"[Title/Abstract] OR '
-        '"torsades de pointes"[Title/Abstract] OR hERG[Title/Abstract] OR IKr[Title/Abstract])'
-    )
+    minimal_terms = ("QT prolongation", "long QT", "torsades de pointes", "hERG", "IKr")
+    minimal = f'("{drug}"[Title/Abstract]) AND {or_join_tiab(minimal_terms)}'
     add("ta_minimal_qt_block", minimal)
     if base and base.lower() != drug.lower():
-        minimal_b = (
-            f'("{base}"[Title/Abstract]) AND ('
-            '"QT prolongation"[Title/Abstract] OR "long QT"[Title/Abstract] OR '
-            '"torsades de pointes"[Title/Abstract] OR hERG[Title/Abstract] OR IKr[Title/Abstract])'
-        )
+        minimal_b = f'("{base}"[Title/Abstract]) AND {or_join_tiab(minimal_terms)}'
         add("ta_minimal_qt_block_salt_stripped", minimal_b)
 
     return out
-
-
-# ---------- Title/Abstract helpers (layered queries) ----------
-
-
-def _ta(term: str) -> str:
-    """Wrap a term/phrase in [Title/Abstract]. Quote if it contains spaces."""
-    t = term.strip()
-    if not t:
-        raise ValueError("empty term")
-    if " " in t and not (t.startswith('"') and t.endswith('"')):
-        t = f'"{t}"'
-    return f"{t}[Title/Abstract]"
 
 
 def _drug_ta(drug_name: str) -> str:
@@ -144,44 +131,28 @@ def _drug_ta(drug_name: str) -> str:
     return f'"{drug}"[Title/Abstract]'
 
 
-# ---------- Keyword groups (tune here) ----------
-
-# hERG / channel — not field-restricted so MeSH / other fields can match.
-_HERG_TERMS = '(hERG OR KCNH2 OR "ether-a-go-go" OR "IKr")'
-
-_BLOCK_TERMS_BROAD = (
-    "(block OR blocker OR blockade OR "
-    "inhibit OR inhibitor OR inhibition OR "
-    "current OR channel)"
-)
-_BLOCK_TERMS_STRICT = "(block OR blocker OR inhibit OR inhibitor OR inhibition)"
-
-_QT_TA_CORE = (
-    '"QT prolongation"[Title/Abstract] '
-    'OR "QTc prolongation"[Title/Abstract] '
-    'OR "long QT"[Title/Abstract] '
-    'OR "prolonged QT"[Title/Abstract]'
-)
-_QT_TA_STRICT = f"({_QT_TA_CORE})"
-_QT_TA_BROAD = (
-    f"({_QT_TA_CORE} "
-    'OR "torsades de pointes"[Title/Abstract] '
-    'OR "torsade de pointes"[Title/Abstract] '
-    "OR TdP[Title/Abstract] "
-    "OR proarrhythmi*[Title/Abstract])"
-)
-
-
 def build_herg_query(drug_name: str, *, broad: bool = False) -> str:
-    """Branch A: drug[TA] AND hERG-family terms AND block/channel terms."""
-    block = _BLOCK_TERMS_BROAD if broad else _BLOCK_TERMS_STRICT
-    return f"{_drug_ta(drug_name)} AND {_HERG_TERMS} AND {block}"
+    """Drug AND (hERG/KCNH2/IKr/ether…) AND (block/inhibit/…)."""
+    actions = BLOCK_ACTION_TERMS_BROAD if broad else BLOCK_ACTION_TERMS_STRICT
+    return (
+        f"{_drug_ta(drug_name)} AND {or_join_bare(MECH_HERG_TERMS)} AND {or_join_bare(actions)}"
+    )
 
 
 def build_qt_query(drug_name: str, *, broad: bool = False) -> str:
-    """Branch B: drug[TA] AND QT / TdP phrases (Title/Abstract only)."""
-    qt = _QT_TA_BROAD if broad else _QT_TA_STRICT
-    return f"{_drug_ta(drug_name)} AND {qt}"
+    """Drug AND (QT/long QT/TdP terms) — all TIAB-scoped."""
+    _ = broad  # reserved for broader TIAB expansions
+    return f"{_drug_ta(drug_name)} AND {or_join_tiab(CLINICAL_QT_TERMS)}"
+
+
+def build_layered_herg_kcnh2_block_query(drug_name: str, *, quote_drug: bool = True) -> str:
+    del quote_drug
+    return build_herg_query(drug_name, broad=False)
+
+
+def build_layered_qt_ta_query(drug_name: str, *, quote_drug: bool = True) -> str:
+    del quote_drug
+    return build_qt_query(drug_name, broad=False)
 
 
 @dataclass(frozen=True)
@@ -193,6 +164,10 @@ class QueryRound:
     min_hits_to_stop: int = 1
 
 
+LAYERED_STRICT_MIN_UNION_TO_SKIP_BROAD = 5
+LAYERED_BROAD_MIN_UNION_TO_STOP = 3
+
+
 def iter_layered_pubmed_query_rounds(
     drug_name: str,
     *,
@@ -200,13 +175,9 @@ def iter_layered_pubmed_query_rounds(
     enable_salt_fallback: bool = True,
 ) -> list[QueryRound]:
     """
-    Ordered tiers for layered search. Caller runs each round in order and may stop
-    once ``len(unique_pmids) >= min_hits_to_stop`` (if ``min_hits_to_stop > 0``).
+    Ordered tiers: strict (inventory) → optional broad → optional salt-stripped strict.
 
-    1. **strict** — original name, narrow hERG/block and QT phrases.
-    2. **broad** — same name, wider synonyms (TdP, channel/current, IKr, …) if enabled.
-    3. **salt_stripped_strict** — de-salted name, strict branches only, if suffix strip changed
-       the string and ``enable_salt_fallback``.
+    Caller runs each round in order and may stop once ``len(unique_pmids) >= min_hits_to_stop``.
     """
     drug = _clean_drug_name(drug_name)
     if not drug:
@@ -219,6 +190,7 @@ def iter_layered_pubmed_query_rounds(
                 ("herg_strict", build_herg_query(drug, broad=False)),
                 ("qt_strict", build_qt_query(drug, broad=False)),
             ],
+            min_hits_to_stop=LAYERED_STRICT_MIN_UNION_TO_SKIP_BROAD,
         ),
     ]
 
@@ -230,6 +202,7 @@ def iter_layered_pubmed_query_rounds(
                     ("herg_broad", build_herg_query(drug, broad=True)),
                     ("qt_broad", build_qt_query(drug, broad=True)),
                 ],
+                min_hits_to_stop=LAYERED_BROAD_MIN_UNION_TO_STOP,
             )
         )
 
@@ -243,6 +216,7 @@ def iter_layered_pubmed_query_rounds(
                         ("herg_salt", build_herg_query(base, broad=False)),
                         ("qt_salt", build_qt_query(base, broad=False)),
                     ],
+                    min_hits_to_stop=1,
                 )
             )
 

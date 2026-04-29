@@ -8,6 +8,8 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from .qt_vocabulary import CLASSIFIER_CLINICAL, CLASSIFIER_MECH, CLASSIFIER_PHENOTYPIC
+
 
 # Priority order: longer / more specific phrases first (so "QT prolongation" wins over "QT" where both match).
 def _sort_terms(terms: Iterable[str]) -> list[str]:
@@ -17,29 +19,16 @@ def _sort_terms(terms: Iterable[str]) -> list[str]:
 def _classify_evidence(matched_cfg_term: str) -> str:
     """
     Classify by the **configured** qt_keywords term that matched, not the raw regex span.
+
+    Vocabulary is sourced from qt_vocabulary.py so PubMed query and classifier stay aligned.
+    Backwards-compatible: emits the same 4 labels as before.
     """
     t = (matched_cfg_term or "").strip()
-    clinical = {
-        "QT",
-        "QT prolongation",
-        "long QT",
-        "torsades de pointes",
-        "TdP",
-    }
-    mech = {"hERG", "KCNH2", "IKr"}
-    pheno = {
-        "APD",
-        "APD90",
-        "FPD",
-        "FPDc",
-        "action potential duration",
-        "field potential duration",
-    }
-    if t in clinical:
+    if t in CLASSIFIER_CLINICAL:
         return "clinical_or_direct_qt_evidence"
-    if t in mech:
+    if t in CLASSIFIER_MECH:
         return "mechanistic_herg_ikr_evidence"
-    if t in pheno:
+    if t in CLASSIFIER_PHENOTYPIC:
         return "phenotypic_repolarization_evidence"
     return "uncertain_relevance"
 

@@ -40,6 +40,10 @@ from rich.logging import RichHandler
 
 from .article_filter import (
 
+    enrich_article_evidence_metadata,
+
+    filter_articles,
+
     filter_articles_with_pmcid,
 
     normalize_any_article,
@@ -48,13 +52,29 @@ from .article_filter import (
 
 from .context_extractor import extract_keyword_contexts
 
+from .evidence_subtypes import classify_evidence_subtypes
+
 from .excel_input import build_drug_jobs, resolve_excel_input_path, resolve_sheet
 
 from .fulltext_extractor import fetch_fulltext_for_articles
 
+from .inference_features import concat_sections_text, extract_inference_features
+
 from .mcp_client import PubMedMCPClient
 
-from .query_builder import iter_layered_pubmed_query_rounds, iter_pubmed_query_fallbacks
+from .query_builder import (
+
+    LAYERED_BROAD_MIN_UNION_TO_STOP,
+
+    LAYERED_STRICT_MIN_UNION_TO_SKIP_BROAD,
+
+    iter_layered_pubmed_query_rounds,
+
+    iter_pubmed_query_fallbacks,
+
+    strip_salt_suffix,
+
+)
 
 from .report_writer import write_excel_batch_markdown, write_json, write_markdown_report
 
@@ -76,11 +96,17 @@ def _project_root() -> Path:
 
 def _load_config(root: Path) -> dict:
 
+    from .qt_vocabulary import classifier_qt_terms_ordered
+
     p = root / "config" / "qt_keywords.yaml"
 
     with p.open("r", encoding="utf-8") as f:
 
-        return yaml.safe_load(f) or {}
+        cfg = yaml.safe_load(f) or {}
+
+    cfg["qt_terms"] = classifier_qt_terms_ordered()
+
+    return cfg
 
 
 
@@ -113,12 +139,18 @@ async def run_pipeline_for_drug(
     q_used = ""
     strategy_used = ""
     layered_round_used: str | None = None
+    loose_pmids: set[str] = set()
+    dn = drug.strip()
+    sb = strip_salt_suffix(dn)
+    base_for_loose: str | None = sb if sb and sb.lower() != dn.lower() else None
 
     if search_strategy == "layered":
         note_extra_layered = (
-            "Layered search: strict → optional broad → optional salt-stripped strict; "
-            "two branches per tier (hERG/channel + QT/TdP TA) merged; "
-            "stops early once min hits reached. PMC open full text is fetched when PMCID is present (same as default)."
+            "Layered search: strict → broad → salt-stripped strict when applicable; "
+            "two branches per tier (hERG + QT TIAB) merged; "
+            f"broad skipped if union ≥ {LAYERED_STRICT_MIN_UNION_TO_SKIP_BROAD} PMIDs after strict; "
+            f"early exit after a tier when union ≥ that tier's min_hits_to_stop (broad: {LAYERED_BROAD_MIN_UNION_TO_STOP}). "
+            "PMC open full text when PMCID is present (same as default)."
         )
         query_rounds = iter_layered_pubmed_query_rounds(drug)
         pmids_merged: list[str] = []
@@ -127,6 +159,8 @@ async def run_pipeline_for_drug(
 
         for qr in query_rounds:
             layered_round_used = qr.name
+            if qr.name == "salt_stripped_strict":
+                pmids_before_salt = set(seen_pmids)
             seen_round: set[str] = set()
             order_round: list[str] = []
             for label, q in qr.queries:
@@ -157,6 +191,8 @@ async def run_pipeline_for_drug(
                     seen_pmids.add(p)
                     pmids_merged.append(p)
             strategy_used = f"layered:{qr.name}"
+            if qr.name == "salt_stripped_strict":
+                loose_pmids = set(seen_pmids) - pmids_before_salt
             if qr.min_hits_to_stop > 0 and len(pmids_merged) >= qr.min_hits_to_stop:
                 break
 
@@ -306,10 +342,34 @@ async def run_pipeline_for_drug(
 
         row.pop("error", None)
 
+        enrich_article_evidence_metadata(
+            row,
+            drug,
+            loose_match=str(row.get("pmid") or "") in loose_pmids,
+            base_name=base_for_loose,
+        )
+
+        sec_blob = concat_sections_text(sections)
+
+        row["evidence_subtypes"] = classify_evidence_subtypes(
+            str(row.get("title") or ""),
+            str(row.get("abstract") or ""),
+            sec_blob or None,
+        )
+
+        row["inference_features"] = extract_inference_features(
+            str(row.get("title") or ""),
+            str(row.get("abstract") or ""),
+            sec_blob or None,
+        )
+
         final_arts.append(row)
 
 
 
+    articles_before_evidence_filter = len(final_arts)
+
+    final_arts = filter_articles(final_arts, drug)
     with_ft = sum(1 for a in final_arts if a.get("fulltext_available"))
 
     with_ctx = sum(1 for a in final_arts if a.get("contexts"))
@@ -337,6 +397,10 @@ async def run_pipeline_for_drug(
         "summary": {
 
             "total_pubmed_articles": len(pmids),
+
+            "articles_before_evidence_filter": articles_before_evidence_filter,
+
+            "articles_after_evidence_filter": len(final_arts),
 
             "articles_with_pmcid": len(with_pmc),
 
@@ -736,6 +800,12 @@ def main() -> int:
 
         s = data.get("summary") or {}
 
+        arts = data.get("articles") or []
+
+        nsub = sum(1 for a in arts if a.get("evidence_subtypes"))
+
+        nfeat = sum(1 for a in arts if a.get("inference_features"))
+
         console.print(
 
             f"[green]Wrote JSON:[/green] {json_path}\n"
@@ -748,7 +818,15 @@ def main() -> int:
 
             f"Full text OK: {s.get('articles_with_fulltext', 0)}  |  "
 
-            f"Context hits: {s.get('articles_with_context', 0)}"
+            f"Context hits: {s.get('articles_with_context', 0)}\n"
+
+            f"articles in: {s.get('articles_before_evidence_filter', 0)}  "
+
+            f"articles kept: {s.get('articles_after_evidence_filter', 0)}  "
+
+            f"subtypes assigned: {nsub}  "
+
+            f"features extracted: {nfeat}"
 
         )
 
@@ -848,13 +926,47 @@ def main() -> int:
 
     ok = sum(1 for r in (batch.get("results") or []) if r.get("ok"))
 
+    ain = 0
+
+    akept = 0
+
+    nsub = 0
+
+    nfeat = 0
+
+    for r in batch.get("results") or []:
+
+        if not r.get("ok"):
+
+            continue
+
+        res = r.get("result") or {}
+
+        summ = res.get("summary") or {}
+
+        ain += int(summ.get("articles_before_evidence_filter", 0))
+
+        akept += int(summ.get("articles_after_evidence_filter", 0))
+
+        for art in res.get("articles") or []:
+
+            if art.get("evidence_subtypes"):
+
+                nsub += 1
+
+            if art.get("inference_features"):
+
+                nfeat += 1
+
     console.print(
 
         f"[green]Wrote JSON:[/green] {json_path}\n"
 
         f"[green]Wrote batch report:[/green] {md_path}\n"
 
-        f"Drugs run: {batch.get('drugs_run', 0)}  |  OK: {ok}  |  failed: {len(batch.get('results') or []) - ok}"
+        f"Drugs run: {batch.get('drugs_run', 0)}  |  OK: {ok}  |  failed: {len(batch.get('results') or []) - ok}\n"
+
+        f"articles in: {ain}  articles kept: {akept}  subtypes assigned: {nsub}  features extracted: {nfeat}"
 
     )
 
