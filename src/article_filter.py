@@ -138,16 +138,7 @@ def _mesh_terms_overlap_classifier_vocab(article: dict[str, Any]) -> bool:
     return False
 
 
-def _passes_keyword_evidence_gate(
-    article: dict[str, Any],
-    *,
-    evidence_filter_on_mesh_tiers: bool,
-) -> bool:
-    tier = str(article.get("tier") or "tiab")
-    if tier in ("mesh_major", "mesh") and not evidence_filter_on_mesh_tiers:
-        return True
-    if tier in ("mesh_major", "mesh") and evidence_filter_on_mesh_tiers:
-        return _is_likely_relevant(article) or _mesh_terms_overlap_classifier_vocab(article)
+def _passes_keyword_evidence_gate(article: dict[str, Any]) -> bool:
     return _is_likely_relevant(article)
 
 
@@ -171,26 +162,10 @@ def _is_likely_relevant(article: dict[str, Any]) -> bool:
 def filter_articles(
     articles: list[dict[str, Any]],
     drug_name: str,
-    *,
-    evidence_filter_on_mesh_tiers: bool = False,
 ) -> list[dict[str, Any]]:
-    """
-    Post-filter keyword/context relevance.
-
-    ``mesh_major`` / ``mesh`` tiers: PubMed query already constrained drugs via MeSH; when
-    ``evidence_filter_on_mesh_tiers`` is False (default), skip abstract keyword gating.
-
-    ``title`` / ``tiab``: always use keyword/context gate.
-
-    Requires ``enrich_article_evidence_metadata`` first (sets contexts / pipeline flags).
-    ``drug_name`` is accepted for API symmetry.
-    """
+    """Drop articles with no keyword context or evidence labels."""
     del drug_name
-    return [
-        a
-        for a in articles
-        if _passes_keyword_evidence_gate(a, evidence_filter_on_mesh_tiers=evidence_filter_on_mesh_tiers)
-    ]
+    return [a for a in articles if _passes_keyword_evidence_gate(a)]
 
 
 def _as_str(x: Any) -> str:

@@ -75,7 +75,9 @@ def extract_keyword_contexts(
     contexts: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, str]] = set()
     matched_terms: list[str] = []
-    max_ctx = 20
+    abstract_count = 0
+    max_abstract = 20
+    max_total = 40
 
     abstract = article.get("abstract") or ""
     if isinstance(abstract, str) and abstract:
@@ -103,8 +105,9 @@ def extract_keyword_contexts(
                         "evidence_type": _classify_evidence(display_term),
                     }
                 )
-                if len(contexts) >= max_ctx:
-                    return {"matched_terms": _sort_terms(matched_terms), "contexts": contexts}
+                abstract_count += 1
+                if abstract_count >= max_abstract:
+                    break
 
     sections = article.get("sections") or []
     if isinstance(sections, list):
@@ -139,7 +142,7 @@ def extract_keyword_contexts(
                             "evidence_type": _classify_evidence(display_term),
                         }
                     )
-                    if len(contexts) >= max_ctx:
+                    if len(contexts) >= max_total:
                         return {
                             "matched_terms": _sort_terms(matched_terms),
                             "contexts": contexts,

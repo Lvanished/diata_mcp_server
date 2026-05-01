@@ -1,86 +1,41 @@
 """
 Builds PubMed query strings for QT / hERG drug-safety lookups.
 
-Strategy: drug-as-topic first, mention-only as fallback.
+Simplified strategy: drug-name AND search-fragment, no tiering.
 
-Tiers (run in this order; stop early once enough hits are collected):
-    1. mesh_major  — drug must be a MeSH Major Topic OR Pharmacological Action.
-                     Highest precision (indexed relevance).
-    2. mesh        — drug appears in any MeSH term OR Pharmacological Action OR
-                     Supplementary Concept OR Substance Name (covers substances not yet
-                     full MeSH headings, including comparative indexing).
-    3. title       — drug name in article Title.
-                     Catches recent / not-yet-indexed papers where the drug is the
-                     study subject (Title is a strong relevance signal).
-    4. tiab        — drug name anywhere in Title or Abstract. Last-resort recall;
-                     callers should treat hits at this tier as low-confidence.
+Drug name is searched in All Fields (covers MeSH, Supplementary Concept,
+Substance Name, Title, Abstract). Salt suffixes are stripped by default.
 
-Each tier is AND-combined with one of two mechanism/clinical OR-blocks:
-    - hERG / IKr / KCNH2 + (block / inhibit / ...)   → mechanistic evidence
-    - QT / long QT / TdP / repolarization (TIAB)     → clinical/phenotypic evidence
+Search-fragment structure — every branch is AND-constrained to avoid noise:
 
-Salt suffixes ("HYDROCHLORIDE", "CITRATE", ...) are stripped from the drug name
-before any query is built; the original is retained only as a final fallback for
-rare cases where the salt form is itself the indexed name.
+  1. herg_mechanistic:  (hERG/KCNH2/IKr) AND (block/assay/affinity/IC50/...)
+  2. qt_clinical:       QT prolongation / QTc / long QT / drug-induced / TdP / proarrhythmic
+  3. qt_ecg:            (QT OR QTc) AND (ECG OR electrocardiogram)
+  4. safety_qt:         (withdrawn / adverse event / safety concern / ...) AND (QT OR hERG OR proarrhythmic)
+  5. preclinical_qt:    (preclinical / in vitro / patch clamp) AND (hERG OR QT OR KCNH2)
+  6. regulatory:        CiPA / ICH S7B / E14  (inherently QT-specific, stand-alone)
+  7. phenotypic:        repolarization / APD / FPD
+
+Fallbacks if 0 hits: try salt-stripped name, then just the drug name alone.
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Literal
 
 from .qt_vocabulary import (
-    BLOCK_ACTION_TERMS_BROAD,
-    BLOCK_ACTION_TERMS_STRICT,
     CLINICAL_QT_TERMS,
     MECH_HERG_TERMS,
     PHENOTYPIC_TERMS,
     quote_for_pubmed,
     or_join_bare,
-    or_join_tiab,
 )
 
 __all__ = [
-    "QueryRound",
-    "Tier",
-    "tier_from_strategy_label",
-    "tier_strength",
-    "article_passes_min_relevance_tier",
-    "build_pubmed_query",
-    "iter_pubmed_query_fallbacks",
-    "build_herg_query",
-    "build_qt_query",
-    "build_layered_herg_kcnh2_block_query",
-    "build_layered_qt_ta_query",
-    "iter_layered_pubmed_query_rounds",
     "strip_salt_suffix",
-    "TIER_MIN_HITS_TO_STOP",
+    "build_simple_query",
+    "iter_simple_fallbacks",
 ]
-
-Tier = Literal["mesh_major", "mesh", "title", "tiab"]
-
-# Precision ordering for optional output filtering (mesh_major = strongest topic signal).
-TIER_RANK_DESCENDING: tuple[Tier, ...] = ("mesh_major", "mesh", "title", "tiab")
-
-
-def tier_strength(tier: str) -> int:
-    """Higher value = higher-precision topic match (mesh_major highest, tiab lowest)."""
-    return {t: 4 - i for i, t in enumerate(TIER_RANK_DESCENDING)}.get(tier, 0)
-
-
-def tier_from_strategy_label(label: str) -> Tier:
-    """Parse tier from labels like ``mesh_major__herg`` (fallback ``tiab``)."""
-    head = (label.split("__", 1)[0].strip() if "__" in label else "").lower()
-    if head in ("mesh_major", "mesh", "title", "tiab"):
-        return head  # type: ignore[return-value]
-    return "tiab"
-
-
-def article_passes_min_relevance_tier(article_tier: str | None, minimum: str) -> bool:
-    """Keep article if its PubMed tier meets ``minimum`` (same scale as ``tier_strength``)."""
-    return tier_strength(article_tier or "tiab") >= tier_strength(minimum)
-
 
 # ---------------------------------------------------------------------------
 # name normalization
@@ -102,192 +57,115 @@ def _normalize_whitespace(s: str) -> str:
 
 
 def strip_salt_suffix(drug_name: str) -> str:
-    """Strip a single trailing salt/formulation token. Idempotent."""
+    """Strip the trailing salt suffix from a drug name."""
     s = _normalize_whitespace(drug_name)
     s = _SALT.sub("", s).strip()
     return _normalize_whitespace(s)
 
 
 def _clean_drug_name(drug_name: str) -> str:
-    """Canonical form used by all query builders: whitespace-normalized AND salt-stripped."""
+    """Canonical form: whitespace-normalized AND salt-stripped."""
     return strip_salt_suffix(drug_name)
 
 
 # ---------------------------------------------------------------------------
-# OR-block builders (drug-independent)
+# search fragment: AND-constrained branches OR'd together
 # ---------------------------------------------------------------------------
 
+# hERG action terms — covers both "blocks hERG" (clinical) and "hERG assay/IC50" (preclinical)
+HERG_ACTION_TERMS: list[str] = [
+    "block", "blocker", "inhibit", "inhibitor", "inhibition",
+    "assay", "affinity", "IC50", "binding",
+]
 
-def _qt_or_block_full() -> str:
-    """Full clinical+mechanistic+phenotypic OR-block, all TIAB-scoped. Used by build_pubmed_query."""
-    parts: list[str] = []
-    for t in CLINICAL_QT_TERMS:
-        parts.append(f"{quote_for_pubmed(t)}[Title/Abstract]")
-    for t in MECH_HERG_TERMS:
-        parts.append(f"{quote_for_pubmed(t)}[Title/Abstract]")
-    for t in PHENOTYPIC_TERMS:
-        parts.append(f"{quote_for_pubmed(t)}[Title/Abstract]")
-    return " OR ".join(parts)
+# QT clinical terms — inherently QT-specific, stand-alone
+QT_CLINICAL_TERMS: list[str] = list(CLINICAL_QT_TERMS) + [
+    "QTc", "drug-induced", "proarrhythmic", "proarrhythmia",
+    "cardiac safety",
+]
+
+# ECG terms — must be AND-combined with QT terms to avoid noise
+ECG_TERMS: list[str] = ["ECG", "electrocardiogram"]
+
+# Safety/withdrawal terms — must be AND-combined with QT/hERG to avoid noise
+SAFETY_TERMS: list[str] = [
+    "withdrawn", "withdrawal", "discontinued", "suspended",
+    "safety concern", "adverse event", "adverse reaction",
+]
+
+# Preclinical/method terms — must be AND-combined with hERG/QT to avoid noise
+PRECLINICAL_TERMS: list[str] = [
+    "preclinical", "in vitro", "patch clamp",
+]
+
+# Regulatory terms — inherently QT-specific, can stand alone
+REGULATORY_TERMS: list[str] = ["CiPA", "ICH S7B", "E14"]
+
+# QT anchoring terms — used to AND-constrain safety/preclinical branches
+QT_ANCHOR_TERMS: list[str] = ["QT", "QTc", "hERG", "KCNH2", "proarrhythmic"]
+
+
+def _build_search_fragment() -> str:
+    # 1. hERG mechanistic: channel AND action
+    herg_mechanistic = f"{or_join_bare(MECH_HERG_TERMS)} AND {or_join_bare(HERG_ACTION_TERMS)}"
+
+    # 2. QT clinical: inherently QT-specific, stand-alone
+    qt_clinical = or_join_bare(QT_CLINICAL_TERMS)
+
+    # 3. QT + ECG: (QT OR QTc) AND (ECG OR electrocardiogram)
+    qt_ecg = f"(QT OR QTc) AND {or_join_bare(ECG_TERMS)}"
+
+    # 4. safety + QT: (withdrawn / adverse event / ...) AND (QT / hERG / proarrhythmic)
+    safety_qt = f"{or_join_bare(SAFETY_TERMS)} AND {or_join_bare(QT_ANCHOR_TERMS)}"
+
+    # 5. preclinical + QT: (preclinical / in vitro / patch clamp) AND (hERG / QT / KCNH2)
+    preclinical_qt = f"{or_join_bare(PRECLINICAL_TERMS)} AND {or_join_bare(QT_ANCHOR_TERMS)}"
+
+    # 6. regulatory: inherently QT-specific, stand-alone
+    regulatory = or_join_bare(REGULATORY_TERMS)
+
+    # 7. phenotypic: repolarization/APD/FPD
+    phenotypic = or_join_bare(PHENOTYPIC_TERMS)
+
+    return f"({herg_mechanistic} OR {qt_clinical} OR {qt_ecg} OR {safety_qt} OR {preclinical_qt} OR {regulatory} OR {phenotypic})"
 
 
 # ---------------------------------------------------------------------------
-# drug-as-topic clause: the heart of the new strategy
+# simple query builder
 # ---------------------------------------------------------------------------
 
-
-def _drug_topic_clause(drug_name: str, tier: Tier) -> str:
-    """
-    Build the drug part of a PubMed query at the requested tier.
-
-    Returned string is already parenthesized and ready to be AND-ed with an OR-block.
-    """
+def build_simple_query(drug_name: str) -> str:
+    """drug-name[tiab] AND search-fragment. [tiab] ensures the molecule appears in title or abstract."""
     drug = _clean_drug_name(drug_name)
     if not drug:
         raise ValueError("drug_name is empty after cleaning")
-    q = quote_for_pubmed(drug)
-
-    # mesh_major: primary-topic / pharmacologic role only — tightest tier.
-    # Supplementary Concept / Substance Name live in ``mesh`` tier (broader substance indexing).
-    if tier == "mesh_major":
-        return f"({q}[MeSH Major Topic] OR {q}[Pharmacological Action])"
-    if tier == "mesh":
-        return (
-            f"({q}[MeSH Terms]"
-            f" OR {q}[Pharmacological Action]"
-            f" OR {q}[Supplementary Concept]"
-            f" OR {q}[Substance Name])"
-        )
-    if tier == "title":
-        return f"{q}[Title]"
-    if tier == "tiab":
-        return f"{q}[Title/Abstract]"
-    raise ValueError(f"unknown tier: {tier!r}")
+    return f"{quote_for_pubmed(drug)}[tiab] AND {_build_search_fragment()}"
 
 
-# ---------------------------------------------------------------------------
-# composite query builders
-# ---------------------------------------------------------------------------
-
-
-def build_herg_query(drug_name: str, *, broad: bool = False, tier: Tier = "tiab") -> str:
-    """Drug-topic AND (hERG/KCNH2/IKr/...) AND (block/inhibit/...)."""
-    actions = BLOCK_ACTION_TERMS_BROAD if broad else BLOCK_ACTION_TERMS_STRICT
-    drug_clause = _drug_topic_clause(drug_name, tier)
-    return f"{drug_clause} AND {or_join_bare(MECH_HERG_TERMS)} AND {or_join_bare(actions)}"
-
-
-def build_qt_query(drug_name: str, *, broad: bool = False, tier: Tier = "tiab") -> str:
-    """Drug-topic AND (QT / long QT / TdP / ...) — clinical OR-block is TIAB-scoped."""
-    _ = broad  # reserved
-    drug_clause = _drug_topic_clause(drug_name, tier)
-    return f"{drug_clause} AND {or_join_tiab(CLINICAL_QT_TERMS)}"
-
-
-def build_pubmed_query(
-    drug_name: str,
-    *,
-    drug_field: str = "Title/Abstract",
-    quote_drug: bool = True,
-) -> str:
+def iter_simple_fallbacks(drug_name: str) -> list[tuple[str, str]]:
     """
-    Backwards-compatible single-string builder.
-
-    `drug_field` may be 'Title/Abstract', 'Text Word', 'Title', 'MeSH Terms',
-    'MeSH Major Topic'. The drug name is salt-stripped first.
-    """
-    del quote_drug  # we always quote
-    drug = _clean_drug_name(drug_name)
-    if not drug:
-        raise ValueError("drug_name is empty after cleaning")
-    field = drug_field.strip()
-    if not field.startswith("["):
-        field = f"[{field}]"
-    return f"({quote_for_pubmed(drug)}{field}) AND ({_qt_or_block_full()})"
-
-
-# Keep these names importable; they now route through the tier system.
-def build_layered_herg_kcnh2_block_query(drug_name: str, *, quote_drug: bool = True) -> str:
-    del quote_drug
-    return build_herg_query(drug_name, broad=False, tier="mesh_major")
-
-
-def build_layered_qt_ta_query(drug_name: str, *, quote_drug: bool = True) -> str:
-    del quote_drug
-    return build_qt_query(drug_name, broad=False, tier="mesh_major")
-
-
-# ---------------------------------------------------------------------------
-# layered rounds
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class QueryRound:
-    """One layered tier: union (label, query) pairs client-side, then optional short-circuit."""
-
-    name: str
-    queries: list[tuple[str, str]]
-    min_hits_to_stop: int = 1
-
-
-# Short-circuit thresholds. Tighter at high-precision tiers, loose at the recall tier.
-TIER_MIN_HITS_TO_STOP: dict[str, int] = {
-    "mesh_major": 3,
-    "mesh": 3,
-    "title": 3,
-    "tiab": 1,
-}
-
-
-def _round_for_tier(drug: str, tier: Tier) -> QueryRound:
-    return QueryRound(
-        name=tier,
-        queries=[
-            (f"{tier}__herg", build_herg_query(drug, broad=False, tier=tier)),
-            (f"{tier}__qt", build_qt_query(drug, broad=False, tier=tier)),
-        ],
-        min_hits_to_stop=TIER_MIN_HITS_TO_STOP[tier],
-    )
-
-
-def iter_layered_pubmed_query_rounds(
-    drug_name: str,
-    *,
-    enable_broad: bool = True,  # kept for API stability; unused
-    enable_salt_fallback: bool = True,  # kept for API stability; unused (salt-strip is now default)
-) -> list[QueryRound]:
-    """
-    Topic-first tier ladder:
-        mesh_major → mesh → title → tiab
-
-    Caller runs each round, takes the union of PMIDs across queries within the
-    round, and stops once `len(unique_pmids) >= round.min_hits_to_stop`.
-    """
-    del enable_broad, enable_salt_fallback
-    drug = _clean_drug_name(drug_name)
-    if not drug:
-        return []
-    return [_round_for_tier(drug, t) for t in ("mesh_major", "mesh", "title", "tiab")]
-
-
-def iter_pubmed_query_fallbacks(drug_name: str) -> list[tuple[str, str]]:
-    """
-    Flat (label, query) ladder, kept for legacy callers that don't use rounds.
-
-    Order matches the new tier ladder: mesh_major → mesh → title → tiab,
-    mechanistic and clinical sub-queries interleaved.
+    Fallback queries when the main query returns 0 hits:
+      1. full query with salt-stripped name (if different)
+      2. drug name alone (no QT/hERG filter — widest recall)
     """
     drug = _clean_drug_name(drug_name)
     if not drug:
         return []
+
+    raw = _normalize_whitespace(drug_name)
+    base = strip_salt_suffix(drug_name)
+
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for tier in ("mesh_major", "mesh", "title", "tiab"):
-        for label_suffix, q in (
-            (f"{tier}__herg", build_herg_query(drug, broad=False, tier=tier)),
-            (f"{tier}__qt", build_qt_query(drug, broad=False, tier=tier)),
-        ):
-            if q not in seen:
-                seen.add(q)
-                out.append((label_suffix, q))
+
+    def add(label: str, q: str) -> None:
+        if q not in seen:
+            seen.add(q)
+            out.append((label, q))
+
+    if base and base.lower() != raw.lower():
+        add("salt_stripped", f"{quote_for_pubmed(base)} AND {_build_search_fragment()}")
+
+    add("drug_only", quote_for_pubmed(drug))
+
     return out
