@@ -61,6 +61,38 @@ def write_markdown_report(data: dict[str, Any], output_path: str | Path) -> None
     lines.append(str(data.get("drug_name", "")))
     lines.append("")
 
+    # ChEMBL enrichment section
+    chembl = data.get("chembl_enrichment")
+    if chembl:
+        lines.append("## ChEMBL Data")
+        if chembl.get("chembl_id"):
+            lines.append(f"- ChEMBL ID: {chembl['chembl_id']}")
+        if chembl.get("pref_name"):
+            lines.append(f"- Preferred name: {chembl['pref_name']}")
+        if chembl.get("max_phase") is not None:
+            lines.append(f"- Max phase: {chembl['max_phase']}")
+        if chembl.get("withdrawn") is not None:
+            lines.append(f"- Withdrawn: {chembl['withdrawn']}")
+        variants = chembl.get("name_variants") or []
+        if variants:
+            lines.append(f"- Name variants used for search: {', '.join(variants)}")
+        known_ids = chembl.get("known_pubmed_ids") or []
+        if known_ids:
+            lines.append(f"- Known PubMed IDs from ChEMBL: {', '.join(known_ids)}")
+        herg = chembl.get("herg_activities") or []
+        if herg:
+            lines.append("")
+            lines.append("### hERG Activities from ChEMBL")
+            lines.append("| Type | Value | Units | pChEMBL | Target |")
+            lines.append("|------|-------|-------|---------|--------|")
+            for h in herg:
+                lines.append(
+                    f"| {h.get('standard_type','')} | {h.get('standard_value','')} | "
+                    f"{h.get('standard_units','')} | {h.get('pchembl_value','')} | "
+                    f"{h.get('target_pref_name','')} |"
+                )
+        lines.append("")
+
     lines.append("## Query")
     ss = str(data.get("search_strategy", "default"))
     lines.append(f"- Search strategy: `{ss}`")

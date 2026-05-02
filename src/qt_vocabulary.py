@@ -66,6 +66,51 @@ PHENOTYPIC_TERMS: tuple[str, ...] = (
     "repolarization",
 )
 
+# Structural inference terms — papers that predict QT/hERG risk from molecular structure features.
+# Covers both general SAR/QSAR concepts and specific features from Features.json.
+STRUCTURAL_INFERENCE_TERMS: tuple[str, ...] = (
+    # General structure-prediction concepts
+    "pharmacophore",
+    "pharmacophore model",
+    "hERG pharmacophore",
+    "structure-activity relationship",
+    "SAR",
+    "QSAR",
+    "structural alert",
+    "structural determinant",
+    "structural feature",
+    "molecular descriptor",
+    "torsadogenic",
+    "proarrhythmic potential",
+    # hERG channel structural mechanism
+    "binding site",
+    "binding pocket",
+    "pore helix",
+    "inner vestibule",
+    "selectivity filter",
+    "aromatic residue",
+    "Y652",
+    "F656",
+    "S6 domain",
+    # Features.json-derived structural features
+    "basic nitrogen",
+    "basic amine",
+    "bis-aryl",
+    "two aromatic rings",
+    "aromatic ring",
+    "lipophilicity",
+    "logP",
+    "Fsp3",
+    "sp3 fraction",
+    "flat molecule",
+    "polar surface area",
+    "tPSA",
+    "rotatable bond",
+    "hydrogen bond acceptor",
+    "hydrogen bond donor",
+    "molecular weight",
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job B: evidence subtype patterns (split uncertain_relevance-rich articles)
@@ -349,6 +394,7 @@ def or_join_bare(terms: Iterable[str]) -> str:
 CLASSIFIER_CLINICAL: frozenset[str] = frozenset(list(CLINICAL_QT_TERMS) + ["QT"])
 CLASSIFIER_MECH: frozenset[str] = frozenset(MECH_HERG_TERMS)
 CLASSIFIER_PHENOTYPIC: frozenset[str] = frozenset(PHENOTYPIC_TERMS)
+CLASSIFIER_STRUCTURAL: frozenset[str] = frozenset(STRUCTURAL_INFERENCE_TERMS)
 
 
 def classifier_qt_terms_ordered() -> list[str]:
@@ -358,7 +404,7 @@ def classifier_qt_terms_ordered() -> list[str]:
     Order: unique insertion order — extract_keyword_contexts re-sorts by length for matching.
     """
     out: list[str] = []
-    for t in ("QT", *CLINICAL_QT_TERMS, *MECH_HERG_TERMS, *PHENOTYPIC_TERMS):
+    for t in ("QT", *CLINICAL_QT_TERMS, *MECH_HERG_TERMS, *PHENOTYPIC_TERMS, *STRUCTURAL_INFERENCE_TERMS):
         if t not in out:
             out.append(t)
     return out

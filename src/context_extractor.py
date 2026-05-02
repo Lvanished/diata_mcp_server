@@ -1,5 +1,8 @@
 """
 Extract keyword windows from abstract and full text; assign evidence_type per hit.
+
+Evidence type quotas ensure structural inference contexts are not squeezed out
+by repetitive clinical/mechanistic terms.
 """
 
 from __future__ import annotations
@@ -8,7 +11,7 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
-from .qt_vocabulary import CLASSIFIER_CLINICAL, CLASSIFIER_MECH, CLASSIFIER_PHENOTYPIC
+from .qt_vocabulary import CLASSIFIER_CLINICAL, CLASSIFIER_MECH, CLASSIFIER_PHENOTYPIC, CLASSIFIER_STRUCTURAL
 
 
 # Priority order: longer / more specific phrases first (so "QT prolongation" wins over "QT" where both match).
@@ -21,7 +24,6 @@ def _classify_evidence(matched_cfg_term: str) -> str:
     Classify by the **configured** qt_keywords term that matched, not the raw regex span.
 
     Vocabulary is sourced from qt_vocabulary.py so PubMed query and classifier stay aligned.
-    Backwards-compatible: emits the same 4 labels as before.
     """
     t = (matched_cfg_term or "").strip()
     if t in CLASSIFIER_CLINICAL:
@@ -30,6 +32,8 @@ def _classify_evidence(matched_cfg_term: str) -> str:
         return "mechanistic_herg_ikr_evidence"
     if t in CLASSIFIER_PHENOTYPIC:
         return "phenotypic_repolarization_evidence"
+    if t in CLASSIFIER_STRUCTURAL:
+        return "structural_inference_evidence"
     return "uncertain_relevance"
 
 
@@ -62,7 +66,13 @@ def extract_keyword_contexts(
     Returns dict with:
       matched_terms: unique matched keywords (as in config, best-effort)
       contexts: list of {source, section, matched_term, context, evidence_type}
-    Max 20 contexts per article, de-duplicated.
+
+    Per-type quotas prevent structural inference contexts from being squeezed out:
+      - clinical: 20
+      - mechanistic: 15
+      - phenotypic: 15
+      - structural: 20
+      - max total: 80
     """
     terms = _sort_terms(keywords)
     patterns: list[tuple[str, re.Pattern[str]]] = []
@@ -75,10 +85,47 @@ def extract_keyword_contexts(
     contexts: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str, str]] = set()
     matched_terms: list[str] = []
-    abstract_count = 0
-    max_abstract = 20
-    max_total = 40
 
+    # Per-type quotas
+    type_counts: dict[str, int] = {}
+    max_per_type = {
+        "clinical_or_direct_qt_evidence": 20,
+        "mechanistic_herg_ikr_evidence": 15,
+        "phenotypic_repolarization_evidence": 15,
+        "structural_inference_evidence": 20,
+    }
+    max_abstract_total = 25
+    max_total = 80
+    abstract_count = 0
+
+    def _add_context(source: str, section: str, display_term: str, snippet: str, ev_type: str) -> bool:
+        """Try to add a context; return False if quota exceeded."""
+        k = _dedup_key(source, section, display_term, snippet)
+        if k in seen:
+            return False
+        seen.add(k)
+
+        if len(contexts) >= max_total:
+            return False
+
+        # Check per-type quota
+        type_counts[ev_type] = type_counts.get(ev_type, 0) + 1
+        type_max = max_per_type.get(ev_type, 20)
+        if type_counts[ev_type] > type_max:
+            return False
+
+        contexts.append({
+            "source": source,
+            "section": section,
+            "matched_term": display_term,
+            "context": snippet,
+            "evidence_type": ev_type,
+        })
+        if display_term not in matched_terms:
+            matched_terms.append(display_term)
+        return True
+
+    # Abstract
     abstract = article.get("abstract") or ""
     if isinstance(abstract, str) and abstract:
         for display_term, pat in patterns:
@@ -89,26 +136,13 @@ def extract_keyword_contexts(
                 snippet = abstract[lo:hi]
                 if len(snippet) < 10:
                     continue
-                k = _dedup_key("abstract", "Abstract", display_term, snippet)
-                if k in seen:
-                    continue
-                seen.add(k)
-                mt = m.group(0)
-                if display_term not in matched_terms and mt:
-                    matched_terms.append(display_term)
-                contexts.append(
-                    {
-                        "source": "abstract",
-                        "section": "Abstract",
-                        "matched_term": display_term,
-                        "context": snippet,
-                        "evidence_type": _classify_evidence(display_term),
-                    }
-                )
-                abstract_count += 1
-                if abstract_count >= max_abstract:
+                ev_type = _classify_evidence(display_term)
+                if _add_context("abstract", "Abstract", display_term, snippet, ev_type):
+                    abstract_count += 1
+                if abstract_count >= max_abstract_total:
                     break
 
+    # Fulltext sections
     sections = article.get("sections") or []
     if isinstance(sections, list):
         for sec in sections:
@@ -126,26 +160,9 @@ def extract_keyword_contexts(
                     snippet = text[lo:hi]
                     if len(snippet) < 10:
                         continue
-                    k = _dedup_key("fulltext", stitle, display_term, snippet)
-                    if k in seen:
-                        continue
-                    seen.add(k)
-                    mt = m.group(0)
-                    if display_term not in matched_terms and mt:
-                        matched_terms.append(display_term)
-                    contexts.append(
-                        {
-                            "source": "fulltext",
-                            "section": stitle,
-                            "matched_term": display_term,
-                            "context": snippet,
-                            "evidence_type": _classify_evidence(display_term),
-                        }
-                    )
+                    ev_type = _classify_evidence(display_term)
+                    _add_context("fulltext", stitle, display_term, snippet, ev_type)
                     if len(contexts) >= max_total:
-                        return {
-                            "matched_terms": _sort_terms(matched_terms),
-                            "contexts": contexts,
-                        }
+                        return {"matched_terms": _sort_terms(matched_terms), "contexts": contexts}
 
     return {"matched_terms": _sort_terms(matched_terms), "contexts": contexts}

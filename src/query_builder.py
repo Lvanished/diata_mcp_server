@@ -27,6 +27,7 @@ from .qt_vocabulary import (
     CLINICAL_QT_TERMS,
     MECH_HERG_TERMS,
     PHENOTYPIC_TERMS,
+    STRUCTURAL_INFERENCE_TERMS,
     quote_for_pubmed,
     or_join_bare,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "strip_salt_suffix",
     "build_simple_query",
     "iter_simple_fallbacks",
+    "build_variant_queries",
 ]
 
 # ---------------------------------------------------------------------------
@@ -105,6 +107,10 @@ REGULATORY_TERMS: list[str] = ["CiPA", "ICH S7B", "E14"]
 QT_ANCHOR_TERMS: list[str] = ["QT", "QTc", "hERG", "KCNH2", "proarrhythmic"]
 
 
+# Structural inference terms — papers predicting QT/hERG risk from molecular features
+STRUCTURAL_TERMS: list[str] = list(STRUCTURAL_INFERENCE_TERMS)
+
+
 def _build_search_fragment() -> str:
     # 1. hERG mechanistic: channel AND action
     herg_mechanistic = f"{or_join_bare(MECH_HERG_TERMS)} AND {or_join_bare(HERG_ACTION_TERMS)}"
@@ -127,7 +133,10 @@ def _build_search_fragment() -> str:
     # 7. phenotypic: repolarization/APD/FPD
     phenotypic = or_join_bare(PHENOTYPIC_TERMS)
 
-    return f"({herg_mechanistic} OR {qt_clinical} OR {qt_ecg} OR {safety_qt} OR {preclinical_qt} OR {regulatory} OR {phenotypic})"
+    # 8. structural inference: pharmacophore/SAR/binding site AND hERG/QT anchor
+    structural_qt = f"{or_join_bare(STRUCTURAL_TERMS)} AND {or_join_bare(QT_ANCHOR_TERMS)}"
+
+    return f"({herg_mechanistic} OR {qt_clinical} OR {qt_ecg} OR {safety_qt} OR {preclinical_qt} OR {regulatory} OR {phenotypic} OR {structural_qt})"
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +149,43 @@ def build_simple_query(drug_name: str) -> str:
     if not drug:
         raise ValueError("drug_name is empty after cleaning")
     return f"{quote_for_pubmed(drug)}[tiab] AND {_build_search_fragment()}"
+
+
+def build_variant_queries(drug_name: str, variants: list[str]) -> list[tuple[str, str]]:
+    """Build PubMed queries for each name variant.
+
+    Returns list of (query_string, label) tuples.
+    Primary drug name query is included first, then each variant.
+    Deduplicates queries that would be identical after cleaning.
+    """
+    drug = _clean_drug_name(drug_name)
+    fragment = _build_search_fragment()
+    out: list[tuple[str, str]] = []
+    seen_queries: set[str] = set()
+
+    # Primary drug name query
+    if drug:
+        q = f"{quote_for_pubmed(drug)}[tiab] AND {fragment}"
+        if q not in seen_queries:
+            seen_queries.add(q)
+            out.append((f"primary:{drug}", q))
+
+    # Variant queries
+    for v in variants:
+        clean_v = _clean_drug_name(v)
+        if not clean_v or _fold(clean_v) == _fold(drug):
+            continue
+        q = f"{quote_for_pubmed(clean_v)}[tiab] AND {fragment}"
+        if q not in seen_queries:
+            seen_queries.add(q)
+            out.append((f"variant:{clean_v}", q))
+
+    return out
+
+
+def _fold(s: str) -> str:
+    import unicodedata
+    return unicodedata.normalize("NFKD", s or "").casefold()
 
 
 def iter_simple_fallbacks(drug_name: str) -> list[tuple[str, str]]:

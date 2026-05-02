@@ -12,11 +12,12 @@ from .qt_vocabulary import classifier_qt_terms_ordered
 from .query_builder import strip_salt_suffix
 
 
-def _pipeline_evidence_flags(article: dict[str, Any]) -> tuple[bool, bool, bool]:
-    """Clinical QT, mechanistic hERG/IKr, phenotypic hits from ``contexts[].evidence_type``."""
+def _pipeline_evidence_flags(article: dict[str, Any]) -> tuple[bool, bool, bool, bool]:
+    """Clinical QT, mechanistic hERG/IKr, phenotypic, structural inference hits."""
     clinical = False
     mech = False
     pheno = False
+    structural = False
     for c in article.get("contexts") or []:
         ev = str(c.get("evidence_type") or "")
         if ev == "clinical_or_direct_qt_evidence":
@@ -25,7 +26,9 @@ def _pipeline_evidence_flags(article: dict[str, Any]) -> tuple[bool, bool, bool]
             mech = True
         elif ev == "phenotypic_repolarization_evidence":
             pheno = True
-    return clinical, mech, pheno
+        elif ev == "structural_inference_evidence":
+            structural = True
+    return clinical, mech, pheno, structural
 
 
 def loose_match_strength(
@@ -63,8 +66,11 @@ def _fold_case(s: str) -> str:
     return unicodedata.normalize("NFKD", s or "").casefold()
 
 
-def _drug_name_variants(drug_name: str) -> list[str]:
-    """Return case-folded, salt-stripped variants of the drug name (deduped, ≥2 chars)."""
+def _drug_name_variants(drug_name: str, extra_variants: list[str] | None = None) -> list[str]:
+    """Return case-folded, salt-stripped variants of the drug name (deduped, ≥2 chars).
+
+    When extra_variants (from ChEMBL synonyms) is provided, merge them in.
+    """
     raw = (drug_name or "").strip()
     if not raw:
         return []
@@ -72,6 +78,11 @@ def _drug_name_variants(drug_name: str) -> list[str]:
     first_token = _fold_case(raw.split()[0]) if raw.split() else ""
     if first_token:
         variants.add(first_token)
+    if extra_variants:
+        for v in extra_variants:
+            fv = _fold_case(strip_salt_suffix(v))
+            if fv and len(fv) >= 2:
+                variants.add(fv)
     out = [v for v in variants if v and len(v) >= 2]
     seen: set[str] = set()
     uniq: list[str] = []
@@ -87,9 +98,9 @@ def _contains_any_variant(text: str, variants: list[str]) -> bool:
     return any(v in blob for v in variants)
 
 
-def drug_in_title_abstract(drug_name: str, article: dict[str, Any]) -> bool:
+def drug_in_title_abstract(drug_name: str, article: dict[str, Any], *, extra_name_variants: list[str] | None = None) -> bool:
     """Whether drug name variants appear in title, abstract, or MeSH descriptor blob."""
-    variants = _drug_name_variants(drug_name)
+    variants = _drug_name_variants(drug_name, extra_name_variants)
     if not variants:
         return False
     mesh_blob = " ".join(article.get("mesh_terms") or [])
@@ -103,14 +114,16 @@ def enrich_article_evidence_metadata(
     *,
     loose_match: bool = False,
     base_name: str | None = None,
+    extra_name_variants: list[str] | None = None,
 ) -> None:
     """Add pipeline audit fields expected by exports and evidence filtering."""
-    article["drug_in_title_abstract"] = drug_in_title_abstract(drug_name, article)
+    article["drug_in_title_abstract"] = drug_in_title_abstract(drug_name, article, extra_name_variants=extra_name_variants)
     article["has_keyword_context"] = bool(article.get("contexts"))
-    p_clin, p_mech, p_pheno = _pipeline_evidence_flags(article)
+    p_clin, p_mech, p_pheno, p_struct = _pipeline_evidence_flags(article)
     article["pipeline_clinical_qt_evidence"] = p_clin
     article["pipeline_mechanistic_evidence"] = p_mech
     article["pipeline_phenotypic_evidence"] = p_pheno
+    article["pipeline_structural_inference_evidence"] = p_struct
     article["pipeline_evidence_types"] = sorted(
         {
             str(c.get("evidence_type"))
